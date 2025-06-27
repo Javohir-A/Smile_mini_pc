@@ -21,6 +21,7 @@ class DetectionConfig(BaseConfig):
     emotion_map: Dict[str, str] = field(default_factory=dict)
     emotion_detection_interval: float = 0.5  # seconds
     min_emotion_duration: float = 1.0  # minimum duration to record emotion change
+    emotion_confidence_threshold: float = 0.3
     
     # Performance settings
     max_faces_per_frame: int = 10
@@ -57,6 +58,7 @@ class DetectionConfig(BaseConfig):
             detection_interval=cls.get_env_int('DETECTION_INTERVAL', 3),
             distance_threshold=cls.get_env_float('DISTANCE_THRESHOLD', 0.6),
             confidence_threshold=cls.get_env_float('CONFIDENCE_THRESHOLD', 0.5),
+            emotion_confidence_threshold=cls.get_env_float('EMOTION_CONFIDENCE_THRESHOLD', 0.5),
             emotion_detection_interval=cls.get_env_float('EMOTION_DETECTION_INTERVAL', 0.5),
             min_emotion_duration=cls.get_env_float('MIN_EMOTION_DURATION', 1.0),
             max_faces_per_frame=cls.get_env_int('MAX_FACES_PER_FRAME', 10),

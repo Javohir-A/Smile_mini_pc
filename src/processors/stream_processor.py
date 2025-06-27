@@ -473,47 +473,107 @@ class CentralizedDisplayManager:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
         return frame
-
+    
     def _draw_face_annotations_directly(self, frame, faces):
-        """Draw face annotations directly on frame (no display manager)"""
+        """Draw face annotations directly on frame with proper names and emotions"""
+        from .emotion_recognizer import normalize_emotion
+        
         for face in faces:
             x, y, w, h = int(face.x), int(face.y), int(face.width), int(face.height)
             
-            # Get emotion color
-            color = self._get_emotion_color_simple(getattr(face, 'emotion', None))
+            # Choose color and thickness based on recognition status
+            if face.is_recognized:
+                color = (0, 255, 0)  # Green for recognized faces
+                thickness = 3
+            else:
+                color = self._get_emotion_color_simple(face.emotion)
+                thickness = 2
             
             # Draw bounding box
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
             
-            # Prepare label
-            label_parts = []
-            if hasattr(face, 'face_id') and face.face_id:
-                label_parts.append(f"ID:{face.face_id[-3:]}")
-            if hasattr(face, 'confidence'):
-                label_parts.append(f"{face.confidence:.2f}")
-            if hasattr(face, 'emotion') and face.emotion:
-                label_parts.append(f"{face.emotion}")
-                if hasattr(face, 'emotion_confidence') and face.emotion_confidence:
-                    label_parts.append(f"({face.emotion_confidence:.2f})")
+            # Prepare labels (same logic as draw_detections)
+            name_parts = []
+            emotion_parts = []
             
-            label = " ".join(label_parts)
+            # Build name label
+            if face.is_recognized and face.human_name:
+                name_parts.append(f"{face.human_name}")
+                if face.recognition_confidence and face.recognition_confidence > 0:
+                    name_parts.append(f"({face.recognition_confidence:.1%})")
+            else:
+                if face.face_id:
+                    name_parts.append(f"Unknown #{face.face_id.split('_')[-1]}")
             
-            # Draw label background and text
-            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
-            cv2.rectangle(frame, (x, y - label_size[1] - 10), (x + label_size[0] + 5, y), color, -1)
-            cv2.putText(frame, label, (x + 2, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            # Build emotion label with normalize_emotion
+            if face.emotion:
+                try:
+                    emotion_text = f"{normalize_emotion(face.emotion).title()}"
+                    if face.emotion_confidence and face.emotion_confidence > 0:
+                        emotion_text += f" {face.emotion_confidence:.0%}"
+                    emotion_parts.append(emotion_text)
+                except Exception:
+                    # Fallback if normalize_emotion is not available
+                    emotion_text = f"{face.emotion.title()}"
+                    if face.emotion_confidence and face.emotion_confidence > 0:
+                        emotion_text += f" {face.emotion_confidence:.0%}"
+                    emotion_parts.append(emotion_text)
             
+            # Draw labels
+            if name_parts or emotion_parts:
+                if face.is_recognized:
+                    # For recognized faces: name on top, emotion below
+                    if name_parts:
+                        name_label = " ".join(name_parts)
+                        self._draw_websocket_label(frame, name_label, (x, y - 10), color, 0.8, 2)
+                    
+                    if emotion_parts:
+                        emotion_label = " ".join(emotion_parts)
+                        emotion_color = self._get_emotion_color_simple(face.emotion)
+                        self._draw_websocket_label(frame, emotion_label, (x, y + h + 25), emotion_color, 0.6, 1)
+                else:
+                    # For unknown faces: show all info in one label
+                    all_parts = name_parts + emotion_parts
+                    main_label = " | ".join(all_parts)
+                    self._draw_websocket_label(frame, main_label, (x, y - 10), color, 0.6, 2)
+        
         return frame
 
-    def _get_emotion_color_simple(self, emotion):
-        """Get BGR color for emotion (simple version)"""
-        emotion_colors = {
-            'happy': (0, 255, 0), 'sad': (255, 0, 0), 'angry': (0, 0, 255),
-            'surprise': (0, 255, 255), 'fear': (128, 0, 128), 'disgust': (0, 128, 0),
-            'neutral': (128, 128, 128), 'unknown': (255, 255, 255)
-        }
-        return emotion_colors.get(emotion or 'unknown', (255, 255, 255))
+    def _draw_websocket_label(self, frame, text, position, color, font_scale, thickness):
+        """Helper method to draw text with background for WebSocket"""
+        x, y = position
+        label_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
         
+        # Draw background rectangle
+        cv2.rectangle(frame, (x, y - label_size[1] - 10), (x + label_size[0] + 10, y + 5), color, -1)
+        
+        # Draw text
+        cv2.putText(frame, text, (x + 5, y - 5), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+
+    # Also update _get_emotion_color_simple to match the main emotion colors:
+    def _get_emotion_color_simple(self, emotion):
+        """Get BGR color for emotion (matching main draw_detections method)"""
+        emotion_colors = {
+            'happy': (0, 255, 0),      # Green
+            'sad': (255, 0, 0),        # Blue  
+            'angry': (0, 0, 255),      # Red
+            'surprise': (0, 255, 255), # Yellow
+            'fear': (128, 0, 128),     # Purple
+            'disgust': (0, 128, 0),    # Dark Green
+            'neutral': (128, 128, 128), # Gray
+            'unknown': (255, 255, 255)  # White
+        }
+        return emotion_colors.get(emotion.lower() if emotion else 'neutral', (255, 255, 255))
+        
+    def _get_emotion_color(self, emotion):
+        """Get emotion color (add this if not present)"""
+        colors = {
+            'happy': (0, 255, 0), 'sad': (255, 0, 0), 'angry': (0, 0, 255),
+            'surprise': (0, 255, 255), 'fear': (128, 0, 128),
+            'disgust': (0, 128, 0), 'neutral': (128, 128, 128)
+        }
+        return colors.get(emotion.lower() if emotion else 'neutral', (255, 255, 255))
+    
         
     def _prepare_annotated_frame(self, frame_data: FrameData):
         """Prepare frame with annotations for FastAPI streaming"""

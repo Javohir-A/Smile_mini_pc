@@ -28,7 +28,6 @@ class StreamApplication:
         self.memory_monitor_task = None
         self.command_handler_task = None
         self.validation_results = {}
-        
         # Mini PC information
         self.mini_pc_info = None
         self.assigned_cameras = []
@@ -113,7 +112,16 @@ class StreamApplication:
                     return False
                 
                 self.mini_pc_info = mini_pc
+                self.config.mini_pc_info = {
+                    "guid" : str(mini_pc.guid),
+                    "company_id" : str(mini_pc.company_id),
+                    "branch_id" : str(mini_pc.branch_id),
+                    "device_name" : str(mini_pc.device_name),
+                    "mac_address": str(mini_pc.mac_address),
+                    "is_active" : str(mini_pc.is_active)
+                }
                 
+                logger.info("MINI PC IN CONFIG: ", self.config.mini_pc_info)
                 # Get assigned cameras
                 logger.info("📹 Retrieving assigned cameras...")
                 cameras = mini_pc_usecase.get_mini_pc_cameras(mini_pc_id=mini_pc.guid)

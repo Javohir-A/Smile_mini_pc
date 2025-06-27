@@ -504,7 +504,7 @@ class FastAPIWebSocketServer:
             active_streams=len([cam for cam in self.camera_info.values() if cam.status == "active"]),
             websocket_fps=15.0  # You can calculate actual FPS if needed
         )
-    
+        
     async def start_server(self):
         """Start FastAPI server"""
         config = uvicorn.Config(
@@ -803,10 +803,10 @@ class FastAPIWebSocketServer:
         """Update camera information once (no broadcasting)"""
         self.camera_info[stream_id] = CameraInfo(
             stream_id=stream_id,
-            name=name or f"Camera {stream_id}",
+            name=name or f"Camera {stream_id}", 
             status=stream_info.status.value,
-            fps=stream_info.fps,
+            fps=stream_info.fps, 
             resolution=stream_info.resolution,
             url=f"/ws/stream/{stream_id}"
-        )
+         )
         # Don't broadcast - just update the info

@@ -39,12 +39,12 @@ class DeepFaceEmotionRecognizer:
         self.available = DEEPFACE_AVAILABLE
         
         self.emotion_cache = {}
-        self.cache_timeout = getattr(config.detection, "emotion_detection_interval", 0.3)  # Reduced from 0.5s for more responsiveness
+        self.cache_timeout = config.detection.emotion_detection_interval
         
         # SIMPLE smoothing - just average last 3 predictions
         self.emotion_histories: Dict[str, SimpleEmotionHistory] = {}
         self.history_size = 3  # Only last 3 predictions
-        self.min_confidence = getattr(config.detection, 'confidence_threshold', 0.25)        
+        self.min_confidence = config.detection.emotion_confidence_threshold        
         
         # Enhanced emotion mapping to boost real emotions
         self.emotion_weights = {

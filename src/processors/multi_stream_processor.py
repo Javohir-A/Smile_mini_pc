@@ -311,7 +311,7 @@ class MultiStreamProcessor:
     def _initialize_all_cameras(self):
         """Initialize ONLY assigned cameras with tracking"""
         logger.info("Initializing assigned cameras with precise tracking...")
-        
+            
         # Clear previous mappings
         self._assigned_camera_mapping.clear()
         self._stream_camera_mapping.clear()

@@ -98,7 +98,7 @@ class FaceDetectionProcessor:
         
         # Processing intervals to reduce load
         self.emotion_process_every = 5  # Process emotion every 5 frames
-        self.recognition_process_every = 10  # Process face recognition every 10 frames
+        self.recognition_process_every = 5  # Process face recognition every 5 frames
         self.frame_counter = 0
         
         # Performance optimization
@@ -1082,7 +1082,7 @@ class FaceDetectionProcessor:
     def _save_unknown_person_to_database(self, face_id: str) -> bool:
         """Save unknown person: best image -> UCode -> create human -> save face embedding"""
         import os, json, requests
-        
+                
         try:
             if face_id in self.unknown_person_manager.saved_faces:
                 return True
@@ -1099,13 +1099,29 @@ class FaceDetectionProcessor:
             quality = best_image_data['quality']
             timestamp = best_image_data['timestamp']
             
+            company_name = getattr(self.config.mini_pc_info, "company_name", "")
+            
+            if not "company_name" in self.config.mini_pc_info:
+                if hasattr(self.config.mini_pc_info, "company_id"):
+                    try:
+                        result = self.ucode_api.items("company").get_single(getattr(self.config.mini_pc_info, "company_id", "")).exec()
+                        company_name = result[0].data_container.data.get("title")
+                        self.config.mini_pc_info["company_name"] = company_name
+                        logger.debug(f"Company name successfuly extracted: {company_name}")
+                        
+                    except Exception as err:
+                        logger.error(f"Failed to get company data from ucode: {err}")
+                        pass
+                else:
+                    logger.error("mini pc info is not initialized")
+                    
             # Create temporary storage for the best image only
             temp_dir = "storage/temp_unknown"
             os.makedirs(temp_dir, exist_ok=True)
             
             # Save best image temporarily
             current_timestamp = int(time.time())
-            filename = f"unknown_{face_id}_{current_timestamp}_quality_{quality['quality_score']:.2f}.jpg"
+            filename = f"{company_name}_client_{current_timestamp}_quality_{quality['quality_score']:.2f}.jpg"
             temp_filepath = os.path.join(temp_dir, filename)
             
             cv2.imwrite(temp_filepath, face_image)
@@ -1140,12 +1156,13 @@ class FaceDetectionProcessor:
                     pass
             
             # STEP 2: Create human in UCode
+            logger.info("COMPANY ID: "+ getattr(self.config.mini_pc_info, "company_id", ""))
             human_guid = ""
             try:
                 human_api_data = {
-                    "full_name": f"Unknown_Client_{current_timestamp}",
-                    # "company_id": "",  # Add if needed
-                    # "branch_id": "",   # Add if needed
+                    "full_name": f"{company_name}_client{current_timestamp}",
+                    "company_id": getattr(self.config.mini_pc_info, "company_id", ""),
+                    "branch_id": getattr(self.config.mini_pc_info, "branch_id", ""),  
                     "photos": [image_url],
                     "type": ["client"]
                 }
@@ -1167,7 +1184,7 @@ class FaceDetectionProcessor:
 
                 face_api_data = {
                     "human_guid": human_guid,
-                    "name": f"Unknown_Client_{current_timestamp}",
+                    "name": f"{company_name}_client{current_timestamp}",
                     "human_type": "client",
                     "image_url": image_url,
                     "metadata": self._make_json_serializable({

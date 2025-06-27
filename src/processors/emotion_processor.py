@@ -1,5 +1,5 @@
 # src/processors/emotion_processor.py - MEMORY QUEUE WITH RETRY LOGIC + CONFIDENCE AVERAGING
-
+import json
 import logging
 import time
 from datetime import datetime, timedelta
@@ -460,7 +460,8 @@ class SimpleEmotionProcessor:
     
     def _send_emotion_to_api(self, emotion: PendingEmotion):
         """Send emotion to API with FIXED JSON serialization and averaged confidence"""
-        try:
+        try:    
+            print(self.config.mini_pc_info)
             # emotion.confidence is now the AVERAGED confidence!
             emotion_data = {
                 "human_id": safe_string(emotion.human_id),
@@ -469,7 +470,8 @@ class SimpleEmotionProcessor:
                 "confidence": safe_float(emotion.confidence),  # This is now averaged!
                 "camera_id": safe_string(emotion.camera_id),
                 "timestamp": emotion.timestamp.isoformat() + "Z",
-                "duration_minutes": safe_float(emotion.duration_minutes)
+                "duration_minutes": safe_float(emotion.duration_minutes),
+                "mini_pc_info" : self.config.mini_pc_info
             }
             
             # Add video URL if available

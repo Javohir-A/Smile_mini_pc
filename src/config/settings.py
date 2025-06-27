@@ -29,6 +29,8 @@ class AppConfig(BaseConfig):
     video: VideoConfig = None
     ucode: UcodeSdkConfig = None
     
+    mini_pc_info = None
+    
     ENABLE_WEBSOCKET: bool = True
     WEBSOCKET_PORT: int = 8765
     WEBSOCKET_QUALITY: int = 80
