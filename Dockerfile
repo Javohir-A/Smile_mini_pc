@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 FROM python:3.11-slim
 WORKDIR /app
 
+# Install runtime dependencies including FFmpeg
 RUN apt-get update && apt-get install -y \
     ffmpeg libpq-dev \
     libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
@@ -24,13 +25,28 @@ RUN apt-get update && apt-get install -y \
     iproute2 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Copy Python packages from builder stage
 COPY --from=builder /install /usr/local
-COPY . .
 
-RUN useradd --create-home --shell /bin/bash appuser && \
-    chown -R appuser:appuser /app
+# Create user FIRST (before creating directories)
+RUN useradd --create-home --shell /bin/bash appuser
+
+# Create directories with proper ownership
+RUN mkdir -p /app/videos /app/temp_videos /app/logs /app/data && \
+    chown -R appuser:appuser /app && \
+    chmod -R 755 /app
+
+# Switch to non-root user
 USER appuser
 
+# Copy application files with proper ownership
+COPY --chown=appuser:appuser . .
+
+# Set environment variables
 ENV PYTHONPATH="/app"
+
+# Expose port for websocket
 EXPOSE 8765
+
+# Use exec form for better signal handling
 ENTRYPOINT ["python", "main.py"]

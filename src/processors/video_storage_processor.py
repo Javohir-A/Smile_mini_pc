@@ -35,7 +35,7 @@ class PersonVideoSession:
 
 class AsyncVideoStorageProcessor:
     """Async video processor that doesn't block real-time streaming"""
-    
+
     def __init__(self, config: AppConfig):
         self.config = config
         self.video_dir = "videos"
@@ -50,26 +50,49 @@ class AsyncVideoStorageProcessor:
         
         self.lock = threading.Lock()
         
-        # Ensure directories exist
-        os.makedirs(self.video_dir, exist_ok=True)
-        os.makedirs(self.temp_dir, exist_ok=True)
-        
-        # Check if ffmpeg is available for better compression
-        self.ffmpeg_available = self._check_ffmpeg()
-        
         # ASYNC: Video processing queue and background worker
         self.video_processing_queue = queue.Queue()
         self.video_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="video_processor")
         self.processing_workers_started = False
         
+        # Setup directories with proper error handling
+        try:
+            os.makedirs(self.video_dir, exist_ok=True)
+            os.makedirs(self.temp_dir, exist_ok=True)
+            
+            # Set proper permissions for Docker container
+            os.chmod(self.video_dir, 0o755)
+            os.chmod(self.temp_dir, 0o755)
+            
+            # Test write permissions
+            test_file = os.path.join(self.temp_dir, "test_write.tmp")
+            with open(test_file, 'w') as f:
+                f.write("test")
+            os.remove(test_file)
+            
+            logger.info(f"✅ Video directories created with proper permissions")
+            
+        except PermissionError as e:
+            logger.error(f"❌ Permission error creating video directories: {e}")
+            # Fallback to system temp directory
+            import tempfile
+            self.temp_dir = tempfile.mkdtemp(prefix="video_temp_")
+            logger.warning(f"Using fallback temp directory: {self.temp_dir}")
+        except Exception as e:
+            logger.error(f"❌ Error setting up video directories: {e}")
+        
+        # Check if ffmpeg is available for better compression
+        self.ffmpeg_available = self._check_ffmpeg()
+        
         logger.info(f"🎥 Async video processor initialized")
         logger.info(f"   Video dir: {self.video_dir}")
+        logger.info(f"   Temp dir: {self.temp_dir}")
         logger.info(f"   FFmpeg available: {self.ffmpeg_available}")
         logger.info(f"   Background processing: Enabled")
         
-        # Start background video processing workers
-        self._start_background_workers()
-    
+        # Start background video processing workers (MOVED OUTSIDE TRY/EXCEPT)
+        self._start_background_workers()    
+  
     def _check_ffmpeg(self) -> bool:
         """Check if ffmpeg is available for video processing"""
         try:
@@ -92,10 +115,10 @@ class AsyncVideoStorageProcessor:
             logger.warning("FFmpeg not found - using OpenCV only (may have browser compatibility issues)")
             return False
 
-    
     def _start_background_workers(self):
         """Start background workers for video processing"""
         if self.processing_workers_started:
+            logger.warning("Background workers already started")
             return
             
         self.processing_workers_started = True
@@ -109,8 +132,13 @@ class AsyncVideoStorageProcessor:
                     # Get video session from queue (blocking with timeout)
                     try:
                         session_data = self.video_processing_queue.get(timeout=1.0)
+                        logger.debug(f"🔄 Got session from queue: {session_data[0].human_name if session_data else 'None'}")
                     except queue.Empty:
                         continue
+                    
+                    if session_data is None:  # Shutdown signal
+                        logger.info("🛑 Video processing worker shutting down")
+                        break
                     
                     session, end_time = session_data
                     
@@ -134,6 +162,8 @@ class AsyncVideoStorageProcessor:
                     
                     except Exception as e:
                         logger.error(f"Error in background video processing: {e}")
+                        import traceback
+                        logger.error(f"Traceback: {traceback.format_exc()}")
                     
                     finally:
                         self.video_processing_queue.task_done()
@@ -143,16 +173,22 @@ class AsyncVideoStorageProcessor:
                     time.sleep(1)
         
         # Start worker threads
-        for i in range(2):  # 2 background workers
-            worker_thread = threading.Thread(
-                target=video_processing_worker, 
-                daemon=True, 
-                name=f"video_worker_{i}"
-            )
-            worker_thread.start()
+        try:
+            for i in range(2):  # 2 background workers
+                worker_thread = threading.Thread(
+                    target=video_processing_worker, 
+                    daemon=True, 
+                    name=f"video_worker_{i}"
+                )
+                worker_thread.start()
+                logger.info(f"✅ Started video worker thread {i}")
+                
+            logger.info("🎬 Background video processing workers started successfully")
             
-        logger.info("🎬 Background video processing workers started")
-    
+        except Exception as e:
+            logger.error(f"❌ Failed to start background workers: {e}")
+            self.processing_workers_started = False
+            
     def add_upload_callback(self, callback: callable):
         """Add callback for when videos are ready to upload"""
         self.upload_callbacks.append(callback)
@@ -237,6 +273,12 @@ class AsyncVideoStorageProcessor:
         """Queue session for background processing - NON-BLOCKING"""
         duration = (end_time - session.start_time).total_seconds()
         
+        logger.debug(f"🎬 Attempting to queue session: {session.human_name} - {session.emotion}")
+        logger.debug(f"   Duration: {duration:.1f}s, Frames: {len(session.frames)}")
+        logger.debug(f"   Min duration: {self.min_video_duration}s")
+        logger.debug(f"   Workers started: {self.processing_workers_started}")
+        logger.debug(f"   Queue size: {self.video_processing_queue.qsize()}")
+        
         if duration < self.min_video_duration:
             logger.debug(f"⏭️ Skipping short video for {session.human_name}: {duration:.1f}s")
             return
@@ -248,7 +290,8 @@ class AsyncVideoStorageProcessor:
         try:
             # Add to processing queue - this is very fast and non-blocking
             self.video_processing_queue.put((session, end_time), block=False)
-            logger.info(f"📋 Queued video for background processing: {session.human_name} - {session.emotion} ({duration:.1f}s)")
+            logger.info(f"📋 Queued video for background processing: {session.human_name} - {session.emotion} ({duration:.1f}s, {len(session.frames)} frames)")
+            logger.debug(f"   New queue size: {self.video_processing_queue.qsize()}")
         except queue.Full:
             logger.warning(f"⚠️ Video processing queue full - dropping video for {session.human_name}")
     
@@ -278,7 +321,7 @@ class AsyncVideoStorageProcessor:
             human_type=human_type,
             emotion=emotion,
             start_time=start_time,
-            frames=deque(maxlen=1800),  # 30 seconds at 30fps
+            frames=deque(maxlen=900),  # 30 seconds at 30fps
             camera_id=camera_id,
             last_seen=start_time
         )
@@ -303,99 +346,139 @@ class AsyncVideoStorageProcessor:
         else:
             return self._create_video_with_opencv_async(session, end_time, filename)
 
+    def _cleanup_temp_frames(self, temp_frames_dir):
+        """Clean up temporary frame directory"""
+        try:
+            if os.path.exists(temp_frames_dir):
+                import shutil
+                shutil.rmtree(temp_frames_dir, ignore_errors=True)
+                logger.debug(f"🧹 Cleaned up temp frames: {temp_frames_dir}")
+        except Exception as e:
+            logger.warning(f"Error cleaning up temp frames: {e}")
+
     def _create_video_with_ffmpeg_async(self, session: PersonVideoSession, end_time: datetime, filename: str) -> Optional[VideoRecord]:
-        """Enhanced FFmpeg video creation with better error handling"""
+        """Enhanced FFmpeg video creation with permission handling"""
         
-        temp_file = os.path.join(self.temp_dir, f"temp_{filename}")
         final_file = os.path.join(self.video_dir, filename)
         
         # Get frame dimensions
-        first_frame = session.frames[0]['frame']
+        if not session.frames:
+            logger.error("No frames available for video creation")
+            return None
+            
+        # Find first valid frame
+        first_frame = None
+        for frame_data in session.frames:
+            if frame_data['frame'] is not None and frame_data['frame'].size > 0:
+                first_frame = frame_data['frame']
+                break
+        
+        if first_frame is None:
+            logger.error("No valid frames found in session")
+            return None
+            
         height, width = first_frame.shape[:2]
+        fps = 15.0
         
-        # Create temporary raw video with OpenCV using most compatible codec
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Use mp4v for temp file
-        fps = 30.0  # Reduced FPS for better compatibility
+        # Create temp directory with fallback options
+        temp_frames_dir = None
+        temp_dir_attempts = [
+            os.path.join(self.temp_dir, f"frames_{filename.replace('.mp4', '')}"),
+            f"/tmp/video_frames_{filename.replace('.mp4', '')}",
+            f"/app/videos/temp_frames_{filename.replace('.mp4', '')}"
+        ]
         
-        temp_writer = cv2.VideoWriter(temp_file, fourcc, fps, (width, height))
-         
-        if not temp_writer.isOpened():
-            logger.error(f"Failed to create temporary video writer")
+        for attempt_dir in temp_dir_attempts:
+            try:
+                os.makedirs(attempt_dir, exist_ok=True)
+                # Test write permission
+                test_file = os.path.join(attempt_dir, "test.tmp")
+                with open(test_file, 'w') as f:
+                    f.write("test")
+                os.remove(test_file)
+                
+                temp_frames_dir = attempt_dir
+                logger.debug(f"✅ Using temp directory: {temp_frames_dir}")
+                break
+                
+            except PermissionError:
+                logger.debug(f"❌ Permission denied for: {attempt_dir}")
+                continue
+            except Exception as e:
+                logger.debug(f"❌ Failed to create: {attempt_dir} - {e}")
+                continue
+        
+        if temp_frames_dir is None:
+            logger.error("❌ Could not create any temp directory for frames")
             return None
         
         try:
-            # Write frames to temporary file
+            # Save frames as individual images
             frames_written = 0
-            for frame_data in session.frames:
-                temp_writer.write(frame_data['frame'])
-                frames_written += 1
             
-            temp_writer.release()
+            for i, frame_data in enumerate(session.frames):
+                if frame_data['frame'] is not None and frame_data['frame'].size > 0:
+                    frame_path = os.path.join(temp_frames_dir, f"frame_{i:06d}.jpg")
+                    
+                    try:
+                        success = cv2.imwrite(frame_path, frame_data['frame'])
+                        if success and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+                            frames_written += 1
+                        else:
+                            logger.warning(f"Failed to write frame {i}")
+                    except Exception as e:
+                        logger.warning(f"Error writing frame {i}: {e}")
             
-            # Verify temp file was created
-            if not os.path.exists(temp_file) or os.path.getsize(temp_file) == 0:
-                logger.error(f"Temporary video file creation failed: {temp_file}")
+            logger.info(f"📸 Successfully wrote {frames_written} frames")
+            
+            if frames_written == 0:
+                logger.error("No frames successfully written")
+                self._cleanup_temp_frames(temp_frames_dir)
                 return None
             
-            # Enhanced FFmpeg command with fallback options
+            # Create video from image sequence
+            input_pattern = os.path.join(temp_frames_dir, 'frame_%06d.jpg')
+            
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-i', temp_file,
-                '-c:v', 'libx264',           # Try H.264 first
-                '-preset', 'ultrafast',      # Fastest encoding
-                '-crf', '28',                # Reasonable quality
-                '-profile:v', 'baseline',    # Maximum compatibility
-                '-level', '3.0',             # Web compatibility
-                '-pix_fmt', 'yuv420p',       # Universal pixel format
-                '-movflags', '+faststart',   # Progressive download
-                '-r', str(fps),              # Frame rate
-                '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
-                '-fflags', '+genpts',        # Generate presentation timestamps
-                '-y',                        # Overwrite output file
+                '-framerate', str(fps),
+                '-i', input_pattern,
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-crf', '28',
+                '-profile:v', 'baseline',
+                '-level', '3.0',
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
+                '-y',
                 final_file
             ]
             
-            # Run FFmpeg with enhanced error handling
-            logger.debug(f"🔧 Converting video with FFmpeg: {filename}")
-            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=60)
+            logger.debug(f"🔧 Running FFmpeg with {frames_written} frames")
+            
+            result = subprocess.run(
+                ffmpeg_cmd, 
+                capture_output=True, 
+                text=True, 
+                timeout=60
+            )
             
             if result.returncode != 0:
-                logger.warning(f"FFmpeg H.264 encoding failed, trying fallback: {result.stderr}")
-                
-                # Fallback: Try with different codec
-                fallback_cmd = [
-                    'ffmpeg',
-                    '-i', temp_file,
-                    '-c:v', 'mpeg4',            # Fallback to MPEG-4
-                    '-preset', 'ultrafast',
-                    '-qscale:v', '3',           # Good quality
-                    '-r', str(fps),
-                    '-y',
-                    final_file
-                ]
-                
-                result = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=60)
-                
-                if result.returncode != 0:
-                    logger.error(f"FFmpeg fallback also failed: {result.stderr}")
-                    return None
-            
-            # Clean up temporary file
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-            
-            # Verify final file
-            if not os.path.exists(final_file):
-                logger.error(f"FFmpeg output file not created: {final_file}")
+                logger.error(f"FFmpeg failed: {result.stderr}")
+                self._cleanup_temp_frames(temp_frames_dir)
                 return None
-                
-            file_size = os.path.getsize(final_file)
-            if file_size == 0:
-                logger.error(f"FFmpeg output file is empty: {final_file}")
-                os.remove(final_file)
+            
+            # Clean up
+            self._cleanup_temp_frames(temp_frames_dir)
+            
+            # Verify output
+            if not os.path.exists(final_file) or os.path.getsize(final_file) == 0:
+                logger.error(f"FFmpeg output failed: {final_file}")
                 return None
             
             duration = (end_time - session.start_time).total_seconds()
+            file_size = os.path.getsize(final_file)
+            
             video_record = VideoRecord(
                 guid=uuid4(),
                 human_id=session.human_id,
@@ -410,20 +493,14 @@ class AsyncVideoStorageProcessor:
                 created_at=datetime.now()
             )
             
-            logger.info(f"✅ Created video with FFmpeg: {filename} ({duration:.1f}s, {frames_written} frames, {file_size} bytes)")
+            logger.info(f"✅ Created video: {filename} ({duration:.1f}s, {frames_written} frames, {file_size} bytes)")
             return video_record
             
-        except subprocess.TimeoutExpired:
-            logger.error(f"FFmpeg encoding timeout for {filename}")
-            return None
         except Exception as e:
             logger.error(f"Error in FFmpeg video creation: {e}")
-            # Clean up temporary files
-            for temp_path in [temp_file, final_file]:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            return None
-
+            self._cleanup_temp_frames(temp_frames_dir)
+            return None    
+            
     def _create_video_with_opencv_async(self, session: PersonVideoSession, end_time: datetime, filename: str) -> Optional[VideoRecord]:
         """Improved OpenCV video creation with better codec handling"""
         
@@ -446,7 +523,7 @@ class AsyncVideoStorageProcessor:
             ('MJPG', cv2.VideoWriter_fourcc(*'MJPG')),  # Motion JPEG
         ]
         
-        fps = 30.0  # Reduced FPS for better compatibility
+        fps = 15.0  # Reduced FPS for better compatibility
         out = None
         successful_codec = None
         
