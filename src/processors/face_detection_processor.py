@@ -1059,9 +1059,17 @@ class FaceDetectionProcessor:
         # Assess quality including pose
         quality_assessment = self._assess_face_quality(face_roi, face_detection)
         
-        # Check if we should capture this face
+        # STRICT FRONTAL CHECK
+        pose_info = quality_assessment.get('pose_info', {})
+        if not pose_info.get('is_frontal', False):
+            logger.debug(f"Skipping {face_detection.face_id} - not frontal: "
+                        f"yaw={pose_info.get('yaw', 0):.1f}°, "
+                        f"pitch={pose_info.get('pitch', 0):.1f}°")
+            return False
+        
+        # Check if we should capture this face (pass recognition status)
         if not self.unknown_person_manager.should_capture_unknown_face(
-            face_detection.face_id, quality_assessment
+            face_detection.face_id, quality_assessment, face_detection.is_recognized
         ):
             return False
         
@@ -1092,6 +1100,14 @@ class FaceDetectionProcessor:
             if not best_images:
                 logger.warning(f"No images available for unknown face {face_id}")
                 return False
+
+            #should be deleted chechking
+            for i, img in enumerate(best_images):
+                quality = img['quality']
+                logger.info(f"Image {i+1}: quality={quality['quality_score']:.2f}, "
+                        f"frontal={quality['pose_info']['is_frontal']}, "
+                        f"blur={quality['blur_score']:.0f}")
+                
             
             # Get the SINGLE best quality image (first one is highest quality)
             best_image_data = best_images[0]
@@ -1099,22 +1115,33 @@ class FaceDetectionProcessor:
             quality = best_image_data['quality']
             timestamp = best_image_data['timestamp']
             
-            company_name = getattr(self.config.mini_pc_info, "company_name", "")
-            
+            company_name = self.config.mini_pc_info.get("company_name", "")
+            logger.info(f"Mini PC info in creating human: {self.config.mini_pc_info}")
+
             if not "company_name" in self.config.mini_pc_info:
-                if hasattr(self.config.mini_pc_info, "company_id"):
+                if self.config.mini_pc_info.get("company_id", False):
                     try:
-                        result = self.ucode_api.items("company").get_single(getattr(self.config.mini_pc_info, "company_id", "")).exec()
-                        company_name = result[0].data_container.data.get("title")
-                        self.config.mini_pc_info["company_name"] = company_name
-                        logger.debug(f"Company name successfuly extracted: {company_name}")
-                        
+                        api_response, response, error = self.ucode_api.items("company").get_single(self.config.mini_pc_info["company_id"]).exec()
+                        # Fix: Unpack the tuple and check for success
+                        print(api_response)
+                        if error is None and api_response is not None:
+                            company_name = api_response.data_container.data.get("response", {}).get("title", "Unknown Company")
+                            self.config.mini_pc_info["company_name"] = company_name
+                            logger.info(f"Company name successfully extracted: {company_name}")
+                        else:
+                            logger.error(f"Failed to get company data: {error}")
+                            company_name = f"company_{self.config.mini_pc_info['company_id'][:8]}"
+                            self.config.mini_pc_info["company_name"] = company_name
                     except Exception as err:
                         logger.error(f"Failed to get company data from ucode: {err}")
-                        pass
+
+                        company_name = f"company_{self.config.mini_pc_info['company_id'][:8]}"
+                        self.config.mini_pc_info["company_name"] = company_name
                 else:
                     logger.error("mini pc info is not initialized")
+                    company_name = "unknown_company"
                     
+            logger.info(f"=== STEP 1: SAVING TEMP FILE ===")
             # Create temporary storage for the best image only
             temp_dir = "storage/temp_unknown"
             os.makedirs(temp_dir, exist_ok=True)
@@ -1127,6 +1154,7 @@ class FaceDetectionProcessor:
             cv2.imwrite(temp_filepath, face_image)
             logger.info(f"Saved best quality image: {filename}")
             
+            logger.info(f"=== STEP 2: UPLOADING TO UCODE ===")
             # STEP 1: Upload to UCode
             image_url = "https://cdn.u-code.io/"
             try:
@@ -1155,6 +1183,7 @@ class FaceDetectionProcessor:
                 except:
                     pass
             
+            logger.info(f"=== STEP 3: CREATING HUMAN ===")
             # STEP 2: Create human in UCode
             logger.info("COMPANY ID: "+ getattr(self.config.mini_pc_info, "company_id", ""))
             human_guid = ""
@@ -1179,6 +1208,7 @@ class FaceDetectionProcessor:
                 logger.error(f"Exception during UCode human creation for {face_id}: {e}")
                 return False
             
+            logger.info(f"=== STEP 4: CALLING EXTERNAL API ===")    
             # STEP 3: Save face embedding via external API
             try:
 
@@ -1290,10 +1320,13 @@ class UnknownPersonManager:
         logger.info(f"UnknownPersonManager initialized: max_attempts={self.max_attempts}, "
                    f"min_captures={self.min_good_captures}, min_quality={self.min_quality_score}")
     
-    def should_capture_unknown_face(self, face_id: str, quality_assessment: dict) -> bool:
+    def should_capture_unknown_face(self, face_id: str, quality_assessment: dict, is_currently_recognized: bool = False) -> bool:        
         """Decide whether to capture this unknown face"""
         current_time = time.time()
         
+        if is_currently_recognized:
+            return False
+    
         # Track when this face was first seen
         if face_id not in self.face_first_seen:
             self.face_first_seen[face_id] = current_time

@@ -278,7 +278,7 @@ class AsyncVideoStorageProcessor:
             human_type=human_type,
             emotion=emotion,
             start_time=start_time,
-            frames=deque(maxlen=900),  # 30 seconds at 30fps
+            frames=deque(maxlen=1800),  # 30 seconds at 30fps
             camera_id=camera_id,
             last_seen=start_time
         )
@@ -315,7 +315,7 @@ class AsyncVideoStorageProcessor:
         
         # Create temporary raw video with OpenCV using most compatible codec
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Use mp4v for temp file
-        fps = 15.0  # Reduced FPS for better compatibility
+        fps = 30.0  # Reduced FPS for better compatibility
         
         temp_writer = cv2.VideoWriter(temp_file, fourcc, fps, (width, height))
          
@@ -446,7 +446,7 @@ class AsyncVideoStorageProcessor:
             ('MJPG', cv2.VideoWriter_fourcc(*'MJPG')),  # Motion JPEG
         ]
         
-        fps = 15.0  # Reduced FPS for better compatibility
+        fps = 30.0  # Reduced FPS for better compatibility
         out = None
         successful_codec = None
         

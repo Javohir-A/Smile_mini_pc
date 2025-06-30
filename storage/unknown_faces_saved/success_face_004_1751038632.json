@@ -1,0 +1,20 @@
+{
+  "face_id": "face_004",
+  "human_guid": "452abd6d-a10d-4673-b9bc-2c6fd7a5a19f",
+  "image_url": "https://cdn.u-code.io/efba2b71-f75f-482f-9b4e-6538961864b7/Media/34caa994-e5e9-4cb3-addb-d35bb3611089__client_1751038632_quality_1.06.jpg",
+  "detection_time": 1751038632,
+  "original_timestamp": 1751038631.7402022,
+  "quality_score": 1.06,
+  "blur_score": 126.37725232948276,
+  "pose_info": {
+    "yaw": 0,
+    "pitch": 0.0,
+    "roll": 7.907162702958458,
+    "is_frontal": true,
+    "pose_quality": 0.6,
+    "pose_score": 0.6,
+    "method": "geometric"
+  },
+  "external_api_url": "https://tabassum.mini-tweet.uz/api/v1/faces/from-url",
+  "success": true
+}
