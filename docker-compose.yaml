@@ -2,26 +2,23 @@ version: '3.8'
 
 services:
   camera-app:
-    image: javohirgo/smile-mini-pc-app:latest  # Use image, not build path here
+    image: javohirgo/smile-mini-pc-app:latest
     container_name: camera-streaming-app
     restart: unless-stopped
 
-    # Uncomment if you're accessing physical cameras
-    # devices:
-    #   - /dev/video0:/dev/video0
-    #   - /dev/video1:/dev/video1
-
     privileged: false
-    network_mode: host  # Required for RTSP, discovery, WebSocket performance
+    network_mode: host
 
     ports:
       - "8765:8765"
 
     volumes:
+      # Keep only these safe volume mounts
       - ./logs:/app/logs
       - ./data:/app/data
-      - ./videos:/app/videos
-      - ./temp_videos:/app/temp_videos
+      # REMOVE these lines that cause permission issues:
+      # - ./videos:/app/videos  
+      # - ./temp_videos:/app/temp_videos
 
     environment:
       - PYTHONPATH=/app

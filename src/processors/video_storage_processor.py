@@ -38,8 +38,6 @@ class AsyncVideoStorageProcessor:
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.video_dir = "videos"
-        self.temp_dir = "temp_videos"
         self.min_video_duration = 0.5  # Minimum 0.5 seconds
         self.max_video_duration = 600.0  # Maximum 10 minutes
         self.timeout_seconds = 5.0  # Person disappeared timeout
@@ -55,44 +53,79 @@ class AsyncVideoStorageProcessor:
         self.video_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="video_processor")
         self.processing_workers_started = False
         
-        # Setup directories with proper error handling
-        try:
-            os.makedirs(self.video_dir, exist_ok=True)
-            os.makedirs(self.temp_dir, exist_ok=True)
-            
-            # Set proper permissions for Docker container
-            os.chmod(self.video_dir, 0o755)
-            os.chmod(self.temp_dir, 0o755)
-            
-            # Test write permissions
-            test_file = os.path.join(self.temp_dir, "test_write.tmp")
-            with open(test_file, 'w') as f:
-                f.write("test")
-            os.remove(test_file)
-            
-            logger.info(f"✅ Video directories created with proper permissions")
-            
-        except PermissionError as e:
-            logger.error(f"❌ Permission error creating video directories: {e}")
-            # Fallback to system temp directory
-            import tempfile
-            self.temp_dir = tempfile.mkdtemp(prefix="video_temp_")
-            logger.warning(f"Using fallback temp directory: {self.temp_dir}")
-        except Exception as e:
-            logger.error(f"❌ Error setting up video directories: {e}")
+        # Setup directories with multiple fallback options
+        self.video_dir = None
+        self.temp_dir = None
+        
+        # Try multiple directory locations in order of preference
+        directory_attempts = [
+            # First try: Application directories (if writable)
+            ("/app/videos", "/app/temp_videos"),
+            # Second try: Current working directory
+            ("./videos", "./temp_videos"),
+            # Third try: User temp directory
+            ("/tmp/app_videos", "/tmp/app_temp_videos"),
+            # Fourth try: System temp (always works)
+            (None, None)  # Will use tempfile.mkdtemp()
+        ]
+        
+        for video_dir, temp_dir in directory_attempts:
+            try:
+                if video_dir is None:
+                    # Last resort: use system temp directories
+                    import tempfile
+                    self.video_dir = tempfile.mkdtemp(prefix="videos_")
+                    self.temp_dir = tempfile.mkdtemp(prefix="temp_videos_")
+                    logger.info(f"✅ Using system temp directories:")
+                    logger.info(f"   Video dir: {self.video_dir}")
+                    logger.info(f"   Temp dir: {self.temp_dir}")
+                    break
+                else:
+                    # Try to create and test the directories
+                    os.makedirs(video_dir, exist_ok=True)
+                    os.makedirs(temp_dir, exist_ok=True)
+                    
+                    # Test write permissions
+                    test_file = os.path.join(temp_dir, "test_write.tmp")
+                    with open(test_file, 'w') as f:
+                        f.write("test")
+                    os.remove(test_file)
+                    
+                    # If we get here, directories work
+                    self.video_dir = video_dir
+                    self.temp_dir = temp_dir
+                    
+                    # Set proper permissions if possible
+                    try:
+                        os.chmod(self.video_dir, 0o755)
+                        os.chmod(self.temp_dir, 0o755)
+                    except:
+                        pass  # Ignore permission errors on chmod
+                    
+                    logger.info(f"✅ Video directories created successfully:")
+                    logger.info(f"   Video dir: {self.video_dir}")
+                    logger.info(f"   Temp dir: {self.temp_dir}")
+                    break
+                    
+            except Exception as e:
+                logger.debug(f"❌ Failed to use directories {video_dir}, {temp_dir}: {e}")
+                continue
+        
+        if self.video_dir is None or self.temp_dir is None:
+            logger.error("❌ Could not create any working directories!")
+            raise Exception("Failed to create video storage directories")
         
         # Check if ffmpeg is available for better compression
         self.ffmpeg_available = self._check_ffmpeg()
         
         logger.info(f"🎥 Async video processor initialized")
-        logger.info(f"   Video dir: {self.video_dir}")
-        logger.info(f"   Temp dir: {self.temp_dir}")
         logger.info(f"   FFmpeg available: {self.ffmpeg_available}")
+        logger.info(f"   Encoding method: {'FFmpeg + H.264' if self.ffmpeg_available else 'OpenCV only'}")
         logger.info(f"   Background processing: Enabled")
         
-        # Start background video processing workers (MOVED OUTSIDE TRY/EXCEPT)
-        self._start_background_workers()    
-  
+        # Start background video processing workers
+        self._start_background_workers()
+        
     def _check_ffmpeg(self) -> bool:
         """Check if ffmpeg is available for video processing"""
         try:
