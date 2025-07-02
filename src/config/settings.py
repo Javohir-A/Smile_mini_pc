@@ -9,6 +9,8 @@ from .external import ExternalConfig
 from .display import DisplayConfig
 from .video import VideoConfig
 from .ucodec import UcodeSdkConfig
+from .rabbitmq import RabbitMQConfig  # NEW
+from .redis import RedisConfig        # NEW
 
 @dataclass
 class AppConfig(BaseConfig):
@@ -28,6 +30,8 @@ class AppConfig(BaseConfig):
     display: DisplayConfig = None
     video: VideoConfig = None
     ucode: UcodeSdkConfig = None
+    rabbitmq: RabbitMQConfig = None      # NEW
+    redis: RedisConfig = None            # NEW
     
     mini_pc_info = None
     
@@ -44,6 +48,9 @@ class AppConfig(BaseConfig):
     api_key: str = ""
     max_worker_threads: int = 4
     
+    # Emotion processing mode configuration
+    use_rabbitmq: bool = True  # NEW: Enable RabbitMQ or fallback to REST API
+    
     def __post_init__(self):
         if self.database is None:
             self.database = DatabaseConfig.from_env()
@@ -59,6 +66,10 @@ class AppConfig(BaseConfig):
             self.video = VideoConfig.from_env()
         if self.ucode is None:
             self.ucode = UcodeSdkConfig.from_env()
+        if self.rabbitmq is None:
+            self.rabbitmq = RabbitMQConfig.from_env()  # NEW
+        if self.redis is None:
+            self.redis = RedisConfig.from_env()        # NEW
         
     @classmethod
     def from_env(cls) -> 'AppConfig':
@@ -71,18 +82,25 @@ class AppConfig(BaseConfig):
             api_base_url=os.getenv("API_BASE_URL", "https://tabassum.mini-tweet.uz/api/v1"),
             enable_gui=os.getenv("ENABLE_GUI", True),
             
-            # ADD these lines:
+            # WebSocket settings
             ENABLE_WEBSOCKET=cls.get_env_bool('ENABLE_WEBSOCKET', True),
             WEBSOCKET_PORT=cls.get_env_int('WEBSOCKET_PORT', 8765),
             WEBSOCKET_QUALITY=cls.get_env_int('WEBSOCKET_QUALITY', 80),
             WEBSOCKET_MAX_FPS=cls.get_env_int('WEBSOCKET_MAX_FPS', 15),
             
+            # NEW: Emotion processing mode
+            use_rabbitmq=cls.get_env_bool('USE_RABBITMQ', True),
+            
+            # Initialize all component configs
             database=DatabaseConfig.from_env(),
             camera=CameraConfig.from_env(),
             detection=DetectionConfig.from_env(),
             external=ExternalConfig.from_env(),
             display=DisplayConfig.from_env(),
-            video=VideoConfig.from_env()
+            video=VideoConfig.from_env(),
+            ucode=UcodeSdkConfig.from_env(),
+            rabbitmq=RabbitMQConfig.from_env(),  # NEW
+            redis=RedisConfig.from_env()         # NEW
         )
         
     def validate(self) -> bool:
@@ -108,6 +126,14 @@ class AppConfig(BaseConfig):
         if not all([self.database.postgres.db_host, self.database.postgres.db_name]):
             errors.append("Database configuration incomplete")
         
+        # NEW: Validate RabbitMQ and Redis if enabled
+        if self.use_rabbitmq:
+            if not self.rabbitmq.validate():
+                errors.append("RabbitMQ configuration validation failed")
+            
+            if not self.redis.validate():
+                errors.append("Redis configuration validation failed")
+        
         if errors:
             print("Configuration validation errors:")
             for error in errors:
@@ -115,21 +141,3 @@ class AppConfig(BaseConfig):
             return False
         
         return True
-
-# Usage example in main.py or wherever you initialize the app:
-"""
-from config import AppConfig
-
-# Load configuration from environment
-config = AppConfig.from_env()
-
-# Validate configuration
-if not config.validate():
-    print("Configuration validation failed")
-    exit(1)
-
-# Use configuration
-print(f"Starting application with {len(config.camera.rtsp_urls)} camera streams")
-print(f"Database: {config.database.postgres.db_host}:{config.database.postgres.db_port}")
-print(f"Milvus: {config.external.milvus.host}:{config.external.milvus.port}")
-"""

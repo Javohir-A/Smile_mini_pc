@@ -26,3 +26,5 @@ class DisplayConfig(BaseConfig):
             show_emotion_labels=cls.get_env_bool('SHOW_EMOTION_LABELS', True),
             fullscreen=cls.get_env_bool('FULLSCREEN', False)
         )
+
+

@@ -11,11 +11,15 @@ from uuid import UUID, uuid4
 from queue import Queue, Empty
 import numpy as np
 from collections import deque
+import pika
+import redis
+import json
 
 from src.processors.face_detection_processor import DetectionResult, FaceDetection
 from src.processors.video_storage_processor import VideoStorageProcessor
 from src.services.video_upload_service import VideoUploadService
 from src.config import AppConfig
+from src.publisher.emotion_publisher import EmotionPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +179,13 @@ class SimpleEmotionProcessor:
         self.confidence_update_interval = 0.5  # Update confidence every 0.5 seconds
         
         # API settings
-        self.api_url = getattr(config, 'api_base_url', 'https://tabassum.mini-tweet.uz/api/v1')
+        # self.api_url = getattr(config, 'api_base_url', 'https://tabassum.mini-tweet.uz/api/v1')
+        
+        self.emotion_publisher = EmotionPublisher(config)
+        
+        logger.info(f"🎥 Emotion processor initialized with new publisher")
+        publisher_status = self.emotion_publisher.get_status()
+        logger.info(f"📊 Publisher status: {publisher_status}")
         
         # Memory-based emotion queue
         self.pending_emotions: Dict[str, PendingEmotion] = {}  # emotion_id -> PendingEmotion
@@ -457,138 +467,121 @@ class SimpleEmotionProcessor:
                 if emotion_id in self.pending_emotions:
                     emotion = self.pending_emotions[emotion_id]
                     self._send_emotion_to_api(emotion)
-    
+        
     def _send_emotion_to_api(self, emotion: PendingEmotion):
-        """Send emotion to API with FIXED JSON serialization and averaged confidence"""
-        try:    
-            print(self.config.mini_pc_info)
-            # emotion.confidence is now the AVERAGED confidence!
+        """Send emotion using new publisher with RabbitMQ and REST fallback"""
+        try:
+            # Prepare emotion data (keeping existing format)
             emotion_data = {
+                "emotion_id": emotion.emotion_id,
                 "human_id": safe_string(emotion.human_id),
+                "human_name": safe_string(emotion.human_name),
                 "human_type": safe_string(emotion.human_type),
                 "emotion_type": safe_string(emotion.emotion_type),
-                "confidence": safe_float(emotion.confidence),  # This is now averaged!
+                "confidence": safe_float(emotion.confidence),  # This is averaged confidence!
                 "camera_id": safe_string(emotion.camera_id),
                 "timestamp": emotion.timestamp.isoformat() + "Z",
                 "duration_minutes": safe_float(emotion.duration_minutes),
-                "mini_pc_info" : self.config.mini_pc_info
+                "mini_pc_info": self.config.mini_pc_info
             }
             
             # Add video URL if available
             if emotion.video_url:
                 emotion_data["video_url"] = safe_string(emotion.video_url)
-                logger.info(f"📹 Sending {emotion.human_name} emotion WITH video URL (avg confidence: {emotion.confidence:.2f})")
+                logger.info(f"📹 Publishing {emotion.human_name} emotion WITH video URL (avg confidence: {emotion.confidence:.2f})")
             else:
-                logger.info(f"📹 Sending {emotion.human_name} emotion WITHOUT video URL (avg confidence: {emotion.confidence:.2f})")
+                logger.info(f"📹 Publishing {emotion.human_name} emotion WITHOUT video URL (avg confidence: {emotion.confidence:.2f})")
             
-            # Log confidence details for debugging
+            # Add confidence details for debugging
             if emotion.confidence_details:
+                emotion_data["confidence_details"] = emotion.confidence_details
                 details = emotion.confidence_details
                 logger.debug(f"📊 Confidence details: avg={details['average']:.2f}, "
                             f"initial={details['initial']:.2f}, final={details['latest']:.2f}, "
                             f"readings={details['readings_count']}")
             
-            response = requests.post(
-                f"{self.api_url}/emotions/detect",
-                json=emotion_data,
-                timeout=10.0,
-                headers={'Content-Type': 'application/json'}
-            )
+            # Publish using new publisher (handles RabbitMQ + REST fallback automatically)
+            success = self.emotion_publisher.publish_emotion(emotion_data)
             
-            if response.status_code in [200, 201]:
+            if success:
                 # Mark as sent
                 emotion.sent_to_api = True
-                
-                # Extract response ID for potential updates
-                try:
-                    response_data = response.json()
-                    emotion.api_response_id = response_data.get('id') or response_data.get('emotional_report_id')
-                except:
-                    pass
                 
                 video_info = " (with video)" if emotion.video_url else " (no video)"
                 readings_info = ""
                 if emotion.confidence_details:
                     readings_info = f" from {emotion.confidence_details['readings_count']} readings"
                 
-                logger.info(f"✅ SUCCESS: Sent {emotion.emotion_type} for {emotion.human_name}{video_info} "
-                           f"(avg confidence: {emotion.confidence:.2f}{readings_info})")
-                
-                # If sent without video, set up retry mechanism
-                if not emotion.video_url:
-                    self._setup_retry_for_video_update(emotion)
-                
+                logger.info(f"✅ PUBLISHED: {emotion.emotion_type} for {emotion.human_name}{video_info} "
+                        f"(avg confidence: {emotion.confidence:.2f}{readings_info})")
             else:
-                logger.error(f"❌ API ERROR {response.status_code}: {response.text}")
+                logger.error(f"❌ PUBLISH FAILED: {emotion.human_name} - {emotion.emotion_type}")
                 emotion.retry_count += 1
                 
                 if emotion.retry_count < self.max_retry_attempts:
                     # Retry after delay
                     emotion.timeout_at = datetime.now() + timedelta(seconds=10)
-                    logger.info(f"🔄 Will retry sending emotion for {emotion.human_name}")
+                    logger.info(f"🔄 Will retry publishing emotion for {emotion.human_name}")
                 else:
                     emotion.sent_to_api = True  # Give up after max retries
                     logger.error(f"❌ Max retries reached for {emotion.human_name}")
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ NETWORK ERROR sending emotion: {e}")
-            emotion.retry_count += 1
+                    
         except Exception as e:
-            logger.error(f"❌ ERROR sending emotion: {e}")
+            logger.error(f"❌ ERROR publishing emotion: {e}")
             # Log more details for debugging
             logger.error(f"Emotion data: human_id={emotion.human_id}, type={emotion.emotion_type}, confidence={emotion.confidence}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
-            emotion.sent_to_api = True  # Mark as sent to avoid infinite loop
-    
-    def _setup_retry_for_video_update(self, emotion: PendingEmotion):
-        """Setup retry mechanism to update emotion with video URL later"""
-        def retry_video_update():
-            # Wait additional time for video to be processed
-            time.sleep(60)  # Wait 1 minute
+            emotion.retry_count += 1
+
+    # def _setup_retry_for_video_update(self, emotion: PendingEmotion):
+    #     """Setup retry mechanism to update emotion with video URL later"""
+    #     def retry_video_update():
+    #         # Wait additional time for video to be processed
+    #         time.sleep(60)  # Wait 1 minute
             
-            with self.pending_lock:
-                if emotion.emotion_id in self.pending_emotions:
-                    # Check if we now have a video URL
-                    if not emotion.video_url:
-                        # Try to find video URL for this emotion
-                        self._try_find_video_for_emotion(emotion)
+    #         with self.pending_lock:
+    #             if emotion.emotion_id in self.pending_emotions:
+    #                 # Check if we now have a video URL
+    #                 if not emotion.video_url:
+    #                     # Try to find video URL for this emotion
+    #                     self._try_find_video_for_emotion(emotion)
                     
-                    if emotion.video_url and emotion.api_response_id:
-                        # Update emotion with video URL via API
-                        self._update_emotion_with_video(emotion)
+    #                 if emotion.video_url and emotion.api_response_id:
+    #                     # Update emotion with video URL via API
+    #                     self._update_emotion_with_video(emotion)
         
-        # Start retry in background
-        threading.Thread(target=retry_video_update, daemon=True).start()
+    #     # Start retry in background
+    #     threading.Thread(target=retry_video_update, daemon=True).start()
     
-    def _try_find_video_for_emotion(self, emotion: PendingEmotion):
-        """Try to find video URL for emotion from recent uploads"""
-        # This could check recent uploads or video storage for matching videos
-        # For now, just log that we're trying
-        logger.info(f"🔍 Searching for video URL for {emotion.human_name} - {emotion.emotion_type}")
+    # def _try_find_video_for_emotion(self, emotion: PendingEmotion):
+    #     """Try to find video URL for emotion from recent uploads"""
+    #     # This could check recent uploads or video storage for matching videos
+    #     # For now, just log that we're trying
+    #     logger.info(f"🔍 Searching for video URL for {emotion.human_name} - {emotion.emotion_type}")
     
-    def _update_emotion_with_video(self, emotion: PendingEmotion):
-        """Update previously sent emotion with video URL"""
-        try:
-            update_data = {
-                "video_url": safe_string(emotion.video_url)
-            }
+    # def _update_emotion_with_video(self, emotion: PendingEmotion):
+    #     """Update previously sent emotion with video URL"""
+    #     try:
+    #         update_data = {
+    #             "video_url": safe_string(emotion.video_url)
+    #         }
             
-            # Use UPDATE API endpoint (you'll need to implement this)
-            response = requests.put(
-                f"{self.api_url}/emotions/{emotion.api_response_id}",
-                json=update_data,
-                timeout=10.0,
-                headers={'Content-Type': 'application/json'}
-            )
+    #         # Use UPDATE API endpoint (you'll need to implement this)
+    #         response = requests.put(
+    #             f"{self.api_url}/emotions/{emotion.api_response_id}",
+    #             json=update_data,
+    #             timeout=10.0,
+    #             headers={'Content-Type': 'application/json'}
+    #         )
             
-            if response.status_code in [200, 204]:
-                logger.info(f"✅ Updated {emotion.human_name} emotion with video URL")
-            else:
-                logger.error(f"❌ Failed to update emotion with video: {response.status_code}")
+    #         if response.status_code in [200, 204]:
+    #             logger.info(f"✅ Updated {emotion.human_name} emotion with video URL")
+    #         else:
+    #             logger.error(f"❌ Failed to update emotion with video: {response.status_code}")
                 
-        except Exception as e:
-            logger.error(f"❌ Error updating emotion with video: {e}")
+    #     except Exception as e:
+    #         logger.error(f"❌ Error updating emotion with video: {e}")
     
     def _get_emotion_category(self, emotion: str) -> str:
         """Convert emotion to one of 3 categories"""
@@ -637,7 +630,9 @@ class SimpleEmotionProcessor:
             pending_count = len(self.pending_emotions)
             sent_count = len([e for e in self.pending_emotions.values() if e.sent_to_api])
             with_video_count = len([e for e in self.pending_emotions.values() if e.video_url])
-        
+
+        publisher_status = self.emotion_publisher.get_status()
+
         return {
             'active_trackers': len(self.trackers),
             'total_confidence_readings': total_confidence_readings,
@@ -646,12 +641,14 @@ class SimpleEmotionProcessor:
             'emotions_with_video': with_video_count,
             'active_emotions': active_emotions,
             'video_queue_size': self.video_url_queue.qsize(),
+            'publisher_status': publisher_status,  # NEW
             'config': {
                 'timeout_seconds': self.timeout_seconds,
                 'video_wait_timeout': self.video_wait_timeout,
                 'max_retries': self.max_retry_attempts,
                 'min_confidence_readings': self.min_confidence_readings,
-                'api_url': self.api_url
+                # 'api_url': self.api_url,
+                'use_rabbitmq': self.config.use_rabbitmq  # NEW
             }
         }
     
@@ -665,7 +662,6 @@ class SimpleEmotionProcessor:
                 self._send_emotion_to_api(emotion)
         
         with self.lock:
-            # Also send currently active emotions
             current_time = datetime.now()
             for tracker in list(self.trackers.values()):
                 self._queue_emotion_for_processing(tracker, current_time, "force_send")
@@ -686,7 +682,10 @@ class SimpleEmotionProcessor:
             # Stop upload service
             if self.upload_service:
                 self.upload_service.stop()
-                
+            
+            if self.emotion_publisher:
+                self.emotion_publisher.cleanup()
+            
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
         
