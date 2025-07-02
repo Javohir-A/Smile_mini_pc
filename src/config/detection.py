@@ -10,7 +10,7 @@ class DetectionConfig(BaseConfig):
     # Model paths
     model_prototxt: str = "src/utils/deploy.prototxt"
     model_weights: str = "src/utils/res10_300x300_ssd_iter_140000_fp16.caffemodel"
-    
+    recognition_threshold: float = 0.80
     # Detection settings
     detection_size: Tuple[int, int] = (416, 416)
     detection_interval: int = 3

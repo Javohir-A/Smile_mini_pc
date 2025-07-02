@@ -23,7 +23,7 @@ class FaceRecognizer:
         self.config = config
         self.available = FACE_RECOGNITION_AVAILABLE
         self.embedding_cache = {}
-        self.cache_timeout = 1.0  # Cache embeddings for 1 second
+        self.cache_timeout = 0.1  # Cache embeddings for 1 second
         
         if not self.available:
             logger.warning("face_recognition not available - face recognition disabled")

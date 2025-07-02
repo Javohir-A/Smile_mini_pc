@@ -2,16 +2,19 @@
 import logging
 import redis
 import time
-from typing import Optional, Set
+from typing import Optional, Set, List
 from datetime import datetime, timedelta
 from threading import Lock
+
+from src.config.redis import RedisConfig
+from src.config.rabbitmq import RabbitMQConfig
 
 logger = logging.getLogger(__name__)
 
 class EmotionExchangeManager:
     """Manages exchange assignment and scaling logic using Redis"""
     
-    def __init__(self, redis_config, rabbitmq_config):
+    def __init__(self, redis_config:RedisConfig, rabbitmq_config:RabbitMQConfig):
         self.redis_config = redis_config
         self.rabbitmq_config = rabbitmq_config
         self.redis_client = None
@@ -118,34 +121,96 @@ class EmotionExchangeManager:
                 logger.error(f"❌ Error managing exchange for human {human_id}: {e}")
                 self.redis_available = False
                 return None
-    
-    def _find_or_create_exchange(self, human_id: str) -> Optional[str]:
-        """Find available exchange or create new one"""
-        try:
-            # Get all existing exchanges
-            exchange_pattern = f"{self.redis_config.exchange_humans_prefix}*"
-            exchange_keys = list(self.redis_client.scan_iter(match=exchange_pattern))
             
-            # Check existing exchanges for available capacity
+    def _find_or_create_exchange(self, human_id: str) -> Optional[str]:
+        """
+        Find available exchange or create new one for a specific human
+        
+        Logic:
+        1. Look for exchanges with available capacity (< max_humans_per_exchange)
+        2. If found, assign this human to that exchange
+        3. If none found, create a new exchange for this human
+        
+        Args:
+            human_id: The human that needs to be assigned to an exchange
+            
+        Returns:
+            str: Exchange name to assign this human to
+            None: If Redis operations fail
+        """
+        try:
+            # Get all existing exchange keys from Redis
+            exchange_pattern = f"{self.redis_config.exchange_humans_prefix}*"
+            exchange_keys: List[str] = list(self.redis_client.scan_iter(match=exchange_pattern))
+            
+            logger.debug(f"🔍 Found {len(exchange_keys)} existing exchanges for human {human_id}")
+            
+            # Check each existing exchange for available capacity
             for exchange_key in exchange_keys:
                 exchange_name = exchange_key.replace(self.redis_config.exchange_humans_prefix, '')
                 humans_count = self.redis_client.scard(exchange_key)
                 
+                logger.debug(f"📊 Exchange {exchange_name}: {humans_count}/{self.rabbitmq_config.max_humans_per_exchange} humans")
+                
+                # Check if this exchange has capacity
                 if humans_count < self.rabbitmq_config.max_humans_per_exchange:
-                    logger.info(f"📍 Found available exchange {exchange_name} "
-                               f"({humans_count}/{self.rabbitmq_config.max_humans_per_exchange})")
+                    # Double-check that this human isn't already in this exchange
+                    # (This is a safety check - shouldn't happen if Redis TTL is working correctly)
+                    is_already_in_exchange = self.redis_client.sismember(exchange_key, human_id)
+                    
+                    if is_already_in_exchange:
+                        logger.warning(f"⚠️ Human {human_id} already in {exchange_name} but not in human_exchange mapping")
+                        return exchange_name
+                    
+                    logger.info(f"📍 Found available exchange {exchange_name} for human {human_id} "
+                            f"({humans_count}/{self.rabbitmq_config.max_humans_per_exchange})")
                     return exchange_name
             
-            # No available exchange, create new one
-            next_number = len(exchange_keys) + 1
-            new_exchange_name = f"{self.rabbitmq_config.exchange_prefix}{next_number}"
+            # No existing exchange has capacity - create a new one
+            new_exchange_number = self._get_next_exchange_number(exchange_keys)
+            new_exchange_name = f"{self.rabbitmq_config.exchange_prefix}{new_exchange_number}"
             
-            logger.info(f"🆕 Creating new exchange: {new_exchange_name}")
+            logger.info(f"🆕 Creating new exchange {new_exchange_name} for human {human_id} "
+                    f"(all {len(exchange_keys)} existing exchanges at capacity)")
+            
             return new_exchange_name
             
         except Exception as e:
-            logger.error(f"❌ Error finding/creating exchange: {e}")
+            logger.error(f"❌ Error finding/creating exchange for human {human_id}: {e}")
             return None
+        
+    def _get_next_exchange_number(self, exchange_keys: List[str]) -> int:
+        """
+        Determine the next exchange number to create
+        
+        This handles cases where exchanges might be deleted/recreated
+        and ensures we don't have naming conflicts
+        """
+        try:
+            existing_numbers = []
+            
+            # Extract numbers from existing exchange names
+            for exchange_key in exchange_keys:
+                exchange_name = exchange_key.replace(self.redis_config.exchange_humans_prefix, '')
+                
+                # Extract number from names like "emotion_exchange_1", "emotion_exchange_2"
+                if exchange_name.startswith(self.rabbitmq_config.exchange_prefix):
+                    number_part = exchange_name.replace(self.rabbitmq_config.exchange_prefix, '')
+                    try:
+                        number = int(number_part)
+                        existing_numbers.append(number)
+                    except ValueError:
+                        logger.warning(f"⚠️ Invalid exchange name format: {exchange_name}")
+            
+            # Return next available number
+            if existing_numbers:
+                return max(existing_numbers) + 1
+            else:
+                return 1  # First exchange
+                
+        except Exception as e:
+            logger.error(f"❌ Error determining next exchange number: {e}")
+            return len(exchange_keys) + 1  # Fallback to simple counting
     
     def _update_exchange_stats(self, exchange_name: str):
         """Update exchange statistics in Redis"""
