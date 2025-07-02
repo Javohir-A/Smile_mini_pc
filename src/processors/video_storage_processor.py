@@ -664,8 +664,7 @@ class AsyncVideoStorageProcessor:
             session = self.active_sessions[human_id]
             self._queue_session_for_processing(session, current_time)
             del self.active_sessions[human_id]
-    
-
+            
     def cleanup(self):
         """Cleanup and finish all active sessions"""
         with self.lock:
