@@ -180,7 +180,7 @@ class SimpleEmotionProcessor:
         self.confidence_update_interval = 0.5  # Update confidence every 0.5 seconds
         
         # API settings
-        # self.api_url = getattr(config, 'api_base_url', 'https://tabassum.mini-tweet.uz/api/v1')
+        self.api_url = getattr(config, 'api_base_url', 'https://tabassum.mini-tweet.uz/api/v1')
         
         self.emotion_publisher = EmotionPublisher(config)
         
