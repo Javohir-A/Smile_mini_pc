@@ -20,6 +20,7 @@ from src.processors.video_storage_processor import VideoStorageProcessor
 from src.services.video_upload_service import VideoUploadService
 from src.config import AppConfig
 from src.publisher.emotion_publisher import EmotionPublisher
+from src.processors.emotion_recognizer import normalize_emotion
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +294,13 @@ class SimpleEmotionProcessor:
                     try:
                         human_id = UUID(face.human_guid)
                         current_detected_people.add(human_id)
-                        emotion_category = self._get_emotion_category(face.emotion)
+                        # emotion_category = self._get_emotion_category(face.emotion)
+                        emotion_category = normalize_emotion(face.emotion)
+                        face_quality_score = self._assess_face_quality_for_emotion(face)
+                        
+                        if face_quality_score < 0.3:  # Skip very poor quality faces
+                            logger.debug(f"Skipping poor quality face for {face.human_name}: quality={face_quality_score:.2f}")
+                            continue
                         
                         if human_id in self.trackers:
                             # Person was already being tracked
@@ -341,6 +348,70 @@ class SimpleEmotionProcessor:
                 tracker = self.trackers[human_id]
                 self._queue_emotion_for_processing(tracker, current_time, detection_result.stream_id)
                 del self.trackers[human_id]
+    
+    def _assess_face_quality_for_emotion(self, face: 'FaceDetection') -> float:
+        """
+        Assess face quality for emotion processing using new pose_info
+        
+        Returns:
+            float: Quality score 0.0-1.0 (higher is better)
+        """
+        quality_score = 0.5  # Base score
+        
+        try:
+            # Factor 1: Detection confidence
+            if face.confidence > 0.7:
+                quality_score += 0.2
+            elif face.confidence > 0.5:
+                quality_score += 0.1
+            
+            # Factor 2: Emotion confidence
+            if face.emotion_confidence and face.emotion_confidence > 0.6:
+                quality_score += 0.2
+            elif face.emotion_confidence and face.emotion_confidence > 0.4:
+                quality_score += 0.1
+            
+            # Factor 3: NEW - Use pose_info if available
+            if face.pose_info:
+                pose_info = face.pose_info
+                
+                # Bonus for frontal faces
+                if pose_info.get('is_frontal', False):
+                    quality_score += 0.2
+                
+                # Additional bonus based on pose quality
+                pose_quality = pose_info.get('pose_quality', 0.0)
+                quality_score += pose_quality * 0.1  # Up to 0.1 bonus
+                
+                # Log pose details occasionally
+                if hasattr(self, '_pose_log_counter'):
+                    self._pose_log_counter += 1
+                else:
+                    self._pose_log_counter = 1
+                    
+                if self._pose_log_counter % 50 == 0:  # Log every 50 faces
+                    logger.debug(f"Face pose: yaw={pose_info.get('yaw', 0):.1f}°, "
+                            f"pitch={pose_info.get('pitch', 0):.1f}°, "
+                            f"frontal={pose_info.get('is_frontal', False)}, "
+                            f"quality={pose_quality:.2f}")
+            
+            # Factor 4: Face size (larger faces generally better for emotion)
+            if hasattr(face, 'width') and hasattr(face, 'height'):
+                face_area = face.width * face.height
+                if face_area > 8000:  # Large face
+                    quality_score += 0.1
+                elif face_area < 3000:  # Small face
+                    quality_score -= 0.1
+            
+            # Ensure score stays in valid range
+            quality_score = max(0.0, min(1.0, quality_score))
+            
+        except Exception as e:
+            logger.warning(f"Error assessing face quality: {e}")
+            quality_score = 0.5  # Default to medium quality
+        
+        return quality_score
+
     
     def _queue_emotion_for_processing(self, tracker: EmotionTracker, end_time: datetime, camera_id: str):
         """Queue emotion for processing with AVERAGED confidence"""
@@ -606,15 +677,25 @@ class SimpleEmotionProcessor:
         logger.debug(f"▶️ Started tracking {emotion} for {human_name} (initial confidence: {confidence:.2f})")
 
     def get_stats(self) -> dict:
-        """Get current statistics with confidence information"""
+        """Get current statistics with new pose and quality information"""
         with self.lock:
             active_emotions = {}
             total_confidence_readings = 0
+            quality_distribution = {'high': 0, 'medium': 0, 'low': 0}
             
             for tracker in self.trackers.values():
                 duration = (datetime.now() - tracker.start_time).total_seconds()
                 confidence_stats = tracker.get_confidence_stats()
                 total_confidence_readings += confidence_stats['readings_count']
+                
+                # Categorize quality based on average confidence
+                avg_conf = confidence_stats['average']
+                if avg_conf > 0.7:
+                    quality_distribution['high'] += 1
+                elif avg_conf > 0.4:
+                    quality_distribution['medium'] += 1
+                else:
+                    quality_distribution['low'] += 1
                 
                 active_emotions[tracker.human_name] = {
                     'emotion': tracker.current_emotion,
@@ -622,6 +703,7 @@ class SimpleEmotionProcessor:
                     'confidence': {
                         'current_avg': f"{confidence_stats['average']:.2f}",
                         'latest': f"{confidence_stats['latest']:.2f}",
+                        'range': f"{confidence_stats['min']:.2f}-{confidence_stats['max']:.2f}",
                         'readings': confidence_stats['readings_count']
                     }
                 }
@@ -630,28 +712,31 @@ class SimpleEmotionProcessor:
             pending_count = len(self.pending_emotions)
             sent_count = len([e for e in self.pending_emotions.values() if e.sent_to_api])
             with_video_count = len([e for e in self.pending_emotions.values() if e.video_url])
-
-        publisher_status = self.emotion_publisher.get_status()
-
+        
+        # Get publisher status if available
+        publisher_status = {}
+        if hasattr(self, 'emotion_publisher'):
+            publisher_status = self.emotion_publisher.get_status()
+        
         return {
             'active_trackers': len(self.trackers),
             'total_confidence_readings': total_confidence_readings,
+            'quality_distribution': quality_distribution,  # NEW
             'pending_emotions': pending_count,
             'sent_emotions': sent_count,
             'emotions_with_video': with_video_count,
             'active_emotions': active_emotions,
             'video_queue_size': self.video_url_queue.qsize(),
-            'publisher_status': publisher_status,  # NEW
+            'publisher_status': publisher_status,
             'config': {
                 'timeout_seconds': self.timeout_seconds,
                 'video_wait_timeout': self.video_wait_timeout,
                 'max_retries': self.max_retry_attempts,
                 'min_confidence_readings': self.min_confidence_readings,
-                # 'api_url': self.api_url,
-                'use_rabbitmq': self.config.use_rabbitmq  # NEW
+                'use_rabbitmq': getattr(self.config, 'use_rabbitmq', False)
             }
         }
-    
+
     def force_send_all(self):
         """Force send all pending emotions"""
         with self.pending_lock:
