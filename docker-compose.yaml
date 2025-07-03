@@ -13,12 +13,8 @@ services:
       - "8765:8765"
 
     volumes:
-      # Keep only these safe volume mounts
       - ./logs:/app/logs
       - ./data:/app/data
-      # REMOVE these lines that cause permission issues:
-      # - ./videos:/app/videos  
-      # - ./temp_videos:/app/temp_videos
 
     environment:
       - PYTHONPATH=/app
