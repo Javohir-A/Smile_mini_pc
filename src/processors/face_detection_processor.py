@@ -80,6 +80,7 @@ class FaceDetectionProcessor:
         self._lock = threading.Lock()
         self.min_face_size: Optional[int] = 80
 
+        self.emotion_cache_clear_every = 30  # Clear every 30 frames (1 second)
         self.ucode_api = new(config=Config(app_id=config.ucode.app_id, base_url=config.ucode.base_url))
         
         self.unknown_person_manager = UnknownPersonManager(config)
@@ -90,20 +91,27 @@ class FaceDetectionProcessor:
         
         # ULTRA OPTIMIZATION: Aggressive caching and processing intervals
         self.face_cache: Dict[str, CachedFaceData] = {}  # Cache all face data
-        self.cache_timeout = 3.0  # Keep cache for 3 seconds
+        self.cache_timeout = 0.5  # Keep cache for 3 seconds
         
         # Recognition cache
         self.recognition_cache = {}
-        self.recognition_cache_timeout = 2.0  # Cache for 2 seconds
+        self.recognition_cache_timeout = 0.2  # Cache for 0.2 seconds
         
         # Processing intervals to reduce load
-        self.emotion_process_every = 5  # Process emotion every 5 frames
+        self.emotion_process_every = 3  # Process emotion every 3 frames
         self.recognition_process_every = 5  # Process face recognition every 5 frames
         self.frame_counter = 0
         
+        self.recognition_in_progress = set()  # Track faces being processed for recognition
+        self.unknown_processing_lock = threading.Lock()  # Lock for unknown person processing
+        self.recognition_lock = threading.Lock()  # Lock for recognition updates
+        
         # Performance optimization
         self.background_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="face_detection")
+
+        self.database_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="database_save")  # ADD THIS
         self.pending_background_tasks = set()
+        
         
         # PERFORMANCE: Reduce logging frequency
         self.log_counter = 0
@@ -152,6 +160,190 @@ class FaceDetectionProcessor:
             
         except Exception as e:
             logger.error(f"Critical error initializing face detection models: {e}")
+    
+    class ConservativeRecognitionSettings:
+        """Conservative settings to prevent false positives"""
+        
+        # Primary threshold
+        L2_THRESHOLD = 1.8          # Stricter than 2.2
+        
+        # Validation thresholds  
+        MAX_DISTANCE = 1.8          # Must be very close match
+        MIN_CONFIDENCE_GAP = 0.3    # Large gap between best and second
+        MIN_RECOGNITION_CONF = 0.65 # 65% minimum confidence
+        MAX_DISTANCE_RATIO = 0.75   # Best must be 25% better than second
+        
+        # For different quality faces
+        HIGH_QUALITY_THRESHOLD = 1.5    # Frontal, good lighting
+        NORMAL_THRESHOLD = 1.8          # Regular conditions  
+        LOW_QUALITY_THRESHOLD = 2.0     # Poor lighting, angle
+    
+    # 2. ADD THESE METHODS AFTER YOUR EXISTING HELPER METHODS:
+    
+    def get_adaptive_threshold(self, face_id: str) -> float:
+        """Get adaptive threshold based on face quality"""
+        
+        cached_data = self.face_cache.get(face_id)
+        if not cached_data or not hasattr(cached_data, 'pose_info'):
+            return self.ConservativeRecognitionSettings.NORMAL_THRESHOLD
+        
+        pose_info = cached_data.pose_info
+        pose_quality = pose_info.get('pose_quality', 0.5)
+        is_frontal = pose_info.get('is_frontal', False)
+        
+        if is_frontal and pose_quality > 0.8:
+            return self.ConservativeRecognitionSettings.HIGH_QUALITY_THRESHOLD
+        elif pose_quality < 0.3:
+            return self.ConservativeRecognitionSettings.LOW_QUALITY_THRESHOLD
+        else:
+            return self.ConservativeRecognitionSettings.NORMAL_THRESHOLD
+
+    def _validate_face_match(self, best_match, all_results, face_id: str) -> bool:
+        """FIXED: Multi-layer validation that handles excellent matches properly"""
+        
+        logger.debug(f"🔍 Validating match for {face_id}: {best_match.name} (L2: {best_match.distance:.3f})")
+        
+        # VALIDATION 1: Distance threshold - but different thresholds for different quality
+        if best_match.distance <= 0.15:
+            # EXCELLENT MATCH: Very close, almost certainly correct
+            logger.debug(f"✅ EXCELLENT MATCH: Distance {best_match.distance:.3f} - skipping other validations")
+            return True
+        elif best_match.distance > 1.8:
+            # TOO FAR: Definitely reject
+            logger.debug(f"❌ Validation failed: Distance {best_match.distance:.3f} > 1.8 (too far)")
+            return False
+        
+        # VALIDATION 2: For good matches (0.15 < distance <= 1.8), check confidence gap
+        if len(all_results) > 1:
+            second_match = all_results[1]
+            confidence_gap = second_match.distance - best_match.distance
+            
+            # ADAPTIVE GAP REQUIREMENT: Better matches need smaller gaps
+            if best_match.distance <= 0.5:
+                min_gap = 0.1  # Very good matches only need small gap
+            elif best_match.distance <= 1.0:
+                min_gap = 0.2  # Good matches need moderate gap
+            else:
+                min_gap = 0.3  # Average matches need large gap
+            
+            if confidence_gap < min_gap:
+                logger.debug(f"❌ Validation failed: Confidence gap {confidence_gap:.3f} < {min_gap:.3f}")
+                logger.debug(f"  Best: {best_match.name} ({best_match.distance:.3f})")
+                logger.debug(f"  Second: {second_match.name} ({second_match.distance:.3f})")
+                return False
+            else:
+                logger.debug(f"✅ Confidence gap OK: {confidence_gap:.3f} >= {min_gap:.3f}")
+        
+        # VALIDATION 3: Minimum recognition confidence
+        recognition_conf = self._calculate_recognition_confidence(best_match.distance)
+        min_confidence = 0.60  # LOWERED: Was 0.65, now 0.60
+        
+        if recognition_conf < min_confidence:
+            logger.debug(f"❌ Validation failed: Recognition confidence {recognition_conf:.3f} < {min_confidence}")
+            return False
+        
+        # VALIDATION 4: Distance ratio check (only for marginal matches)
+        if best_match.distance > 0.5 and len(all_results) > 1:
+            second_match = all_results[1]
+            distance_ratio = best_match.distance / second_match.distance
+            max_ratio = 0.80  # RELAXED: Was 0.75, now 0.80
+            
+            if distance_ratio > max_ratio:
+                logger.debug(f"❌ Validation failed: Distance ratio {distance_ratio:.3f} > {max_ratio}")
+                return False
+        
+        logger.debug(f"✅ All validations passed for {best_match.name}")
+        return True
+
+    def _calculate_recognition_confidence(self, l2_distance: float) -> float:
+        """Calculate recognition confidence from L2 distance"""
+        # L2 distance to confidence mapping
+        # 0.0 distance = 100% confidence
+        # 1.0 distance = ~75% confidence  
+        # 2.0 distance = ~50% confidence
+        # 3.0+ distance = <25% confidence
+        
+        if l2_distance <= 0.5:
+            return 1.0  # 100% confidence for very close matches
+        elif l2_distance <= 1.0:
+            return 0.95 - (l2_distance - 0.5) * 0.4  # 95% to 75%
+        elif l2_distance <= 2.0:
+            return 0.75 - (l2_distance - 1.0) * 0.25  # 75% to 50%
+        else:
+            return max(0.0, 0.5 - (l2_distance - 2.0) * 0.2)  # 50% to 0%
+
+    def debug_current_recognition(self, face_roi: np.ndarray, face_id: str) -> dict:
+        """Debug current recognition to understand why wrong person is matched"""
+        
+        if not self.face_recognizer or not self.face_usecase:
+            return {"error": "Recognition not available"}
+        
+        face_embedding = self.face_recognizer.extract_face_embedding(face_roi, face_id)
+        if not face_embedding:
+            return {"error": "Could not extract embedding"}
+        
+        # Test with different thresholds
+        results = {}
+        thresholds = [1.5, 1.8, 2.0, 2.2, 2.5, 3.0]
+        
+        for threshold in thresholds:
+            try:
+                search_results = self.face_usecase.search_similar_faces(
+                    face_embedding, limit=5, threshold=threshold
+                )
+                
+                threshold_results = []
+                for i, match in enumerate(search_results[:3]):
+                    confidence = self._calculate_recognition_confidence(match.distance)
+                    is_valid = self._validate_face_match(match, search_results, face_id)
+                    
+                    threshold_results.append({
+                        "rank": i + 1,
+                        "name": match.name,
+                        "distance": round(match.distance, 3),
+                        "confidence": round(confidence, 3),
+                        "is_valid": is_valid,
+                        "human_guid": match.human_guid
+                    })
+                
+                results[f"threshold_{threshold}"] = threshold_results
+                
+            except Exception as e:
+                results[f"threshold_{threshold}"] = {"error": str(e)}
+        
+        return results
+    
+    def _debug_validation_failure(self, best_match, all_results, face_id: str):
+        """Debug why validation is failing"""
+        
+        logger.info(f"🔍 DEBUGGING VALIDATION FAILURE for {face_id}:")
+        logger.info(f"  Best match: {best_match.name}")
+        logger.info(f"  L2 distance: {best_match.distance:.3f}")
+        logger.info(f"  Recognition confidence: {self._calculate_recognition_confidence(best_match.distance):.3f}")
+        
+        if len(all_results) > 1:
+            second_match = all_results[1]
+            gap = second_match.distance - best_match.distance
+            logger.info(f"  Second match: {second_match.name} (L2: {second_match.distance:.3f})")
+            logger.info(f"  Confidence gap: {gap:.3f}")
+            
+            if best_match.distance <= 0.5:
+                required_gap = 0.1
+            elif best_match.distance <= 1.0:
+                required_gap = 0.2
+            else:
+                required_gap = 0.3
+            
+            logger.info(f"  Required gap: {required_gap:.3f}")
+            logger.info(f"  Gap sufficient: {gap >= required_gap}")
+        
+        # Test different thresholds
+        logger.info(f"  Would pass with different criteria:")
+        logger.info(f"    Distance <= 0.15: {best_match.distance <= 0.15}")
+        logger.info(f"    Distance <= 0.20: {best_match.distance <= 0.20}")
+        logger.info(f"    Distance <= 0.30: {best_match.distance <= 0.30}")
+        logger.info(f"    Distance <= 1.00: {best_match.distance <= 1.00}")
+
     
     def _initialize_face_usecase(self):
         """Initialize face usecase with proper error handling and validation"""
@@ -242,74 +434,117 @@ class FaceDetectionProcessor:
         )
         self.face_cache[face_id] = new_cache_data
         return new_cache_data       
-    
+
+# PRECISE THRESHOLD FIX: Stop false positive matches
+
     def _update_face_cache_async(self, face_id: str, face_roi_expanded: np.ndarray, 
-                            face_roi: np.ndarray, should_process_pose: bool = False):
-        """Update face cache with recognition and emotion data in background"""
+                        face_roi: np.ndarray, should_process_pose: bool = False):
+        """UPDATED: Better validation logic"""
         def background_update():
             try:
+                with self.recognition_lock:
+                    if face_id in self.recognition_in_progress:
+                        return
+                    self.recognition_in_progress.add(face_id)
+                
                 current_time = time.time()
                 cached_data = self.face_cache.get(face_id)
                 if not cached_data:
-                    logger.debug(f"No cached data for face {face_id}")
                     return
 
-                # Debug logging
-                logger.debug(f"Processing face {face_id}: emotion={cached_data.emotion}, recognized={cached_data.is_recognized}")
-
-                # Ensure pose_info exists
                 if not hasattr(cached_data, 'pose_info') or cached_data.pose_info is None:
                     cached_data.pose_info = self._get_default_pose_info()
 
-                # Face recognition (expensive operation) - only for unrecognized faces
-                if (self.face_recognizer and self.face_recognizer.available and
-                    self.face_usecase and not cached_data.is_recognized):
+                # Recognition processing
+                if (self.face_recognizer and self.face_recognizer.available and self.face_usecase):
+                    should_check_recognition = (
+                        not cached_data.is_recognized or
+                        (current_time - cached_data.last_update) > 8.0
+                    )
                     
-                    logger.debug(f"Attempting recognition for face {face_id}")
-                    face_embedding = self.face_recognizer.extract_face_embedding(face_roi_expanded, face_id)
-                    if face_embedding:
-                        logger.debug(f"Got embedding for face {face_id}, searching database")
-                        search_results = self.face_usecase.search_similar_faces(
-                            face_embedding, limit=1, threshold=0.6
-                        )
-                        if search_results and len(search_results) > 0:
-                            best_match = search_results[0]
-                            logger.debug(f"Found match for face {face_id}: {best_match.name} (confidence: {best_match.recognition_confidence})")
-                            if best_match.recognition_confidence >= self.config.detection.recognition_threshold:
-                                cached_data.human_guid = best_match.human_guid
-                                cached_data.human_name = best_match.name
-                                cached_data.human_type = best_match.human_type
-                                cached_data.recognition_confidence = best_match.recognition_confidence
-                                cached_data.is_recognized = True
-                                logger.info(f"Background: Face {face_id} recognized as {best_match.name}")
+                    if should_check_recognition:
+                        logger.debug(f"Checking database for face {face_id}")
+                        
+                        face_embedding = self.face_recognizer.extract_face_embedding(face_roi_expanded, face_id)
+                        
+                        if face_embedding:
+                            search_results = self.face_usecase.search_similar_faces(
+                                face_embedding, limit=5, threshold=2.0  # SLIGHTLY INCREASED from 1.8
+                            )
+                            
+                            if search_results and len(search_results) > 0:
+                                # Log all matches
+                                logger.info(f"🔍 Recognition analysis for {face_id}:")
+                                for i, match in enumerate(search_results[:3]):
+                                    confidence = self._calculate_recognition_confidence(match.distance)
+                                    logger.info(f"  {i+1}. {match.name} - L2: {match.distance:.3f}, conf: {confidence:.3f}")
+                                
+                                best_match = search_results[0]
+                                
+                                # USE SIMPLER VALIDATION
+                                is_valid_match = self._validate_face_match(best_match, search_results, face_id)                                
+                                
+                                if is_valid_match:
+                                    with self.recognition_lock:
+                                        cached_data.human_guid = best_match.human_guid
+                                        cached_data.human_name = best_match.name
+                                        cached_data.human_type = best_match.human_type
+                                        cached_data.recognition_confidence = self._calculate_recognition_confidence(best_match.distance)
+                                        cached_data.is_recognized = True
+                                    
+                                    logger.info(f"✅ RECOGNIZED: Face {face_id} as '{best_match.name}' "
+                                            f"(L2: {best_match.distance:.3f}, conf: {cached_data.recognition_confidence:.1%})")
+                                    
+                                    with self.unknown_processing_lock:
+                                        if face_id in self.unknown_person_manager.unknown_faces_buffer:
+                                            self.unknown_person_manager.cleanup_face(face_id)
+                                        self.unknown_person_manager.saved_faces.add(face_id)
+                                else:
+                                    logger.info(f"❌ REJECTED MATCH: Face {face_id} -> '{best_match.name}' "
+                                            f"(L2: {best_match.distance:.3f}) - failed validation")
+                                    
+                                    # ADD DEBUGGING FOR FAILURES
+                                    self._debug_validation_failure(best_match, search_results, face_id)
+                            else:
+                                logger.info(f"🔍 NO MATCHES: Face {face_id} - processing as unknown")
 
-                # Emotion recognition (expensive operation) - PROCESS FOR ALL FACES
+                # Emotion processing (unchanged)
                 if self.emotion_recognizer and self.emotion_recognizer.available:
-                    logger.debug(f"Processing emotion for face {face_id}")
-                    emotion, emotion_conf, *_ = self.emotion_recognizer.predict_emotion(face_roi, face_id)
-                    if emotion and emotion_conf > 0.3:
-                        logger.debug(f"Updated emotion for face {face_id}: {emotion} ({emotion_conf})")
-                        cached_data.emotion = emotion
-                        cached_data.emotion_confidence = emotion_conf
-                    else:
-                        logger.debug(f"Low confidence emotion for face {face_id}: {emotion} ({emotion_conf})")
+                    should_update_emotion = True
+                    
+                    if should_update_emotion:
+                        try:
+                            emotion_result = self.emotion_recognizer.predict_emotion(face_roi, None)
+                            
+                            if emotion_result and len(emotion_result) >= 2:
+                                emotion, emotion_conf = emotion_result[0], emotion_result[1]
+                                
+                                if emotion and emotion_conf > 0.1:
+                                    old_emotion = cached_data.emotion
+                                    cached_data.emotion = emotion
+                                    cached_data.emotion_confidence = emotion_conf
+                                    
+                                    if old_emotion != emotion:
+                                        logger.info(f"🎭 EMOTION CHANGED for {face_id}: {old_emotion} -> {emotion} ({emotion_conf:.2f})")
+                            
+                        except Exception as e:
+                            logger.error(f"🎭 Emotion processing error for {face_id}: {e}")
 
                 cached_data.last_update = current_time
                 cached_data.update_count += 1
 
             except Exception as e:
                 logger.error(f"Background face update error for {face_id}: {e}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
             finally:
-                # Remove from pending tasks
+                with self.recognition_lock:
+                    self.recognition_in_progress.discard(face_id)
                 self.pending_background_tasks.discard(face_id)
 
-        # Only start background task if not already running for this face
         if face_id not in self.pending_background_tasks:
             self.pending_background_tasks.add(face_id)
-            self.background_executor.submit(background_update) 
-           
+            self.background_executor.submit(background_update)
+
+
     def _extract_face_regions(self, frame: np.ndarray, detection: np.ndarray, w: int, h: int) -> tuple:
         """Extract face regions from detection - FAST"""
         x1 = max(0, int(detection[3] * w))
@@ -340,20 +575,17 @@ class FaceDetectionProcessor:
         return x1, y1, width, height, face_roi_expanded, face_roi
 
     def _should_process_expensive_operations(self) -> tuple:
-        """Determine if expensive operations should run this frame"""
+        """FIXED: Process emotions more frequently for dynamic updates"""
         should_process_recognition = (self.frame_counter % self.recognition_process_every == 0)
-        should_process_emotion = (self.frame_counter % self.emotion_process_every == 0)
+        should_process_emotion = (self.frame_counter % 2 == 0)  # FIXED: Every 2 frames instead of 3
         should_process_pose = (self.frame_counter % getattr(self, 'pose_process_every', 10) == 0)
         
         return should_process_recognition, should_process_emotion, should_process_pose
 
-        
-# Modify _process_single_detection to include unknown person processing:
-
     def _process_single_detection(self, frame: np.ndarray, detection: np.ndarray, 
                                 w: int, h: int, should_process_recognition: bool,
                                 should_process_emotion: bool, should_process_pose: bool) -> Optional[FaceDetection]:
-        """Process a single face detection - OPTIMIZED"""
+        """Process a single face detection - OPTIMIZED WITH BETTER UNKNOWN FACE PROCESSING"""
         confidence = detection[2]
         
         if confidence <= self.min_confidence:
@@ -378,19 +610,25 @@ class FaceDetectionProcessor:
         # Create face detection object
         face_detection = self._create_face_detection_object(x1, y1, width, height, confidence, face_id, cached_data)
         
-        # Process unknown faces (run this in background to avoid slowing down main thread)
-        if not face_detection.is_recognized and should_process_pose:
+        # IMPROVED: Process unknown faces more frequently (every 3 frames instead of every 10)
+        should_process_unknown = (self.frame_counter % 3 == 0)
+        
+        logger.debug(f"🔍 DEBUG: face_id={face_id}, is_recognized={face_detection.is_recognized}, frame_counter={self.frame_counter}, should_process_unknown={should_process_unknown}")
+        
+        if not face_detection.is_recognized and should_process_unknown:
+            logger.info(f"🚀 SUBMITTING unknown face processing for {face_id}")  # ADD THIS
             try:
                 self.background_executor.submit(
                     self._process_unknown_face, face_roi, face_detection
                 )
-            except Exception:
-                pass  # Don't let unknown face processing errors affect main pipeline
+            except Exception as e:
+                logger.error(f"❌ Error submitting unknown face processing: {e}")  # ADD THIS
         
         return face_detection
 
+
     def process_frame(self, frame_data: FrameData) -> Optional[DetectionResult]:
-        """Process a single frame - ULTRA-OPTIMIZED with pose detection"""
+        """FIXED: Filter out duplicate faces and force emotion updates"""
         if not self.net:
             return None
         
@@ -398,12 +636,10 @@ class FaceDetectionProcessor:
         self.frame_counter += 1
         self.log_counter += 1
         
-        if self.frame_counter % 18000 == 0:  # ~5 minutes at 60fps
-            try:
-                self.background_executor.submit(self.unknown_person_manager.cleanup_old_first_seen)
-            except Exception:
-                pass
-        
+        if self.frame_counter % self.emotion_cache_clear_every == 0:
+            if hasattr(self.emotion_recognizer, 'clear_emotion_cache'):
+                self.emotion_recognizer.clear_emotion_cache()
+                logger.debug("🎭 Cleared emotion cache for dynamic updates")
         try:
             frame = frame_data.frame
             h, w = frame.shape[:2]
@@ -417,9 +653,12 @@ class FaceDetectionProcessor:
             should_process_recognition, should_process_emotion, should_process_pose = self._should_process_expensive_operations()
             should_log = (self.log_counter % self.log_every_n_frames == 0)
             
-            # Process all detections
+            # CRITICAL FIX: Pre-filter overlapping detections
+            filtered_detections = self._filter_overlapping_detections(detections[0, 0, :, :])
+            
+            # Process filtered detections
             face_detections = []
-            for i, detection in enumerate(detections[0, 0, :, :]):
+            for detection in filtered_detections:
                 face_detection = self._process_single_detection(
                     frame, detection, w, h, 
                     should_process_recognition, should_process_emotion, should_process_pose
@@ -427,9 +666,12 @@ class FaceDetectionProcessor:
                 if face_detection:
                     face_detections.append(face_detection)
             
+            # CRITICAL FIX: Remove duplicate faces by name/position
+            unique_face_detections = self._remove_duplicate_faces(face_detections)
+            
             # Create and store result
-            result = self._create_detection_result(frame_data, face_detections, start_time)
-            self._store_and_notify(result, frame_data, face_detections, should_log)
+            result = self._create_detection_result(frame_data, unique_face_detections, start_time)
+            self._store_and_notify(result, frame_data, unique_face_detections, should_log)
             
             return result
             
@@ -476,37 +718,59 @@ class FaceDetectionProcessor:
             return self.stream_detections.get(stream_id)
 
     def _assign_face_id(self, x: int, y: int, width: int, height: int) -> str:
-        """Improved face ID assignment with better tracking"""
+        """FIXED: Better face tracking to prevent multiple boxes for same person"""
         center_x = x + width // 2
         center_y = y + height // 2
         current_time = time.time()
         
-        # INCREASE DISTANCE THRESHOLD for better face continuity
-        distance_threshold = 15000  # Increased from 10000 (100^2 to ~122^2 pixels)
+        # CRITICAL FIX: Increase distance threshold to merge closer faces
+        distance_threshold = 40000  # Increased from 25000 to prevent duplicate boxes
+        overlap_threshold = 0.3     # NEW: Check for overlapping faces
         
         min_distance = float('inf')
         closest_id = None
         
-        # Clean up old faces first (more frequently)
-        if self.frame_counter % 60 == 0:  # Every 60 frames instead of 150
-            timeout = 5.0  # Reduced from 10.0 seconds
-            to_remove = [
-                fid for fid, (_, _, timestamp) in self.face_tracker.items()
-                if current_time - timestamp > timeout
-            ]
+        # Enhanced cleanup - more aggressive
+        if self.frame_counter % 90 == 0:  # Every 3 seconds
+            timeout_unrecognized = 5.0    # Faster cleanup
+            timeout_recognized = 12.0     
+            
+            to_remove = []
+            for fid, (_, _, timestamp) in self.face_tracker.items():
+                cached_data = self.face_cache.get(fid)
+                is_recognized = cached_data and cached_data.is_recognized
+                
+                timeout = timeout_recognized if is_recognized else timeout_unrecognized
+                
+                if current_time - timestamp > timeout:
+                    to_remove.append(fid)
+            
             for fid in to_remove:
                 self.face_tracker.pop(fid, None)
+                # Clean up all related data
                 self.face_cache.pop(fid, None)
-                logger.debug(f"Cleaned up old face ID: {fid}")
+                if hasattr(self.face_recognizer, 'embedding_cache'):
+                    cache_key = f"{fid}_embedding"
+                    self.face_recognizer.embedding_cache.pop(cache_key, None)
+                self.unknown_person_manager.cleanup_face(fid)
+                logger.debug(f"Cleaned up old face: {fid}")
         
-        for face_id, (prev_x, prev_y, _) in self.face_tracker.items():
+        # CRITICAL FIX: Check for overlapping faces
+        for face_id, (prev_x, prev_y, timestamp) in self.face_tracker.items():
             distance = (center_x - prev_x) ** 2 + (center_y - prev_y) ** 2
-            if distance < min_distance and distance < distance_threshold:
-                min_distance = distance
-                closest_id = face_id
+            
+            # Calculate overlap percentage
+            overlap = self._calculate_overlap_percentage(x, y, width, height, prev_x, prev_y, width, height)
+            
+            # Use either distance OR overlap criteria
+            if (distance < distance_threshold) or (overlap > overlap_threshold):
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_id = face_id
         
         if closest_id:
             self.face_tracker[closest_id] = (center_x, center_y, current_time)
+            logger.debug(f"Updated existing face ID: {closest_id}")
             return closest_id
         else:
             new_id = f"face_{self.next_face_id:03d}"
@@ -514,8 +778,126 @@ class FaceDetectionProcessor:
             self.face_tracker[new_id] = (center_x, center_y, current_time)
             logger.debug(f"Created new face ID: {new_id}")
             return new_id
-    
- 
+
+    def _filter_overlapping_detections(self, detections) -> list:
+        """Filter out overlapping face detections before processing"""
+        if len(detections) <= 1:
+            return detections
+        
+        # Sort by confidence (highest first)
+        sorted_detections = sorted(detections, key=lambda x: x[2], reverse=True)
+        
+        filtered = []
+        for detection in sorted_detections:
+            confidence = detection[2]
+            if confidence <= self.min_confidence:
+                continue
+                
+            x1 = detection[3]
+            y1 = detection[4]
+            x2 = detection[5]
+            y2 = detection[6]
+            
+            # Check if this detection overlaps with any already accepted detection
+            overlaps = False
+            for accepted in filtered:
+                ax1, ay1, ax2, ay2 = accepted[3], accepted[4], accepted[5], accepted[6]
+                
+                overlap_percentage = self._calculate_detection_overlap(x1, y1, x2, y2, ax1, ay1, ax2, ay2)
+                
+                if overlap_percentage > 0.5:  # 50% overlap threshold
+                    overlaps = True
+                    break
+            
+            if not overlaps:
+                filtered.append(detection)
+        
+        logger.debug(f"Filtered {len(detections)} detections to {len(filtered)} unique faces")
+        return filtered
+
+    def _calculate_detection_overlap(self, x1, y1, x2, y2, ax1, ay1, ax2, ay2) -> float:
+        """Calculate overlap between two detection boxes"""
+        try:
+            # Calculate intersection
+            left = max(x1, ax1)
+            top = max(y1, ay1)
+            right = min(x2, ax2)
+            bottom = min(y2, ay2)
+            
+            if left < right and top < bottom:
+                intersection_area = (right - left) * (bottom - top)
+                area1 = (x2 - x1) * (y2 - y1)
+                area2 = (ax2 - ax1) * (ay2 - ay1)
+                union_area = area1 + area2 - intersection_area
+                
+                return intersection_area / union_area if union_area > 0 else 0
+            return 0.0
+        except:
+            return 0.0
+
+    def _remove_duplicate_faces(self, face_detections: List[FaceDetection]) -> List[FaceDetection]:
+        """Remove duplicate faces by name and position"""
+        if len(face_detections) <= 1:
+            return face_detections
+        
+        unique_faces = []
+        seen_names = set()
+        
+        # Sort by recognition confidence (highest first)
+        sorted_faces = sorted(face_detections, 
+                            key=lambda f: f.recognition_confidence if f.recognition_confidence else 0, 
+                            reverse=True)
+        
+        for face in sorted_faces:
+            # For recognized faces, check by name
+            if face.is_recognized and face.human_name:
+                if face.human_name in seen_names:
+                    logger.debug(f"Skipping duplicate recognized face: {face.human_name}")
+                    continue
+                seen_names.add(face.human_name)
+            
+            # For unknown faces, check by position
+            else:
+                is_duplicate = False
+                for existing in unique_faces:
+                    if not existing.is_recognized:  # Compare with other unknown faces
+                        distance = ((face.x - existing.x) ** 2 + (face.y - existing.y) ** 2) ** 0.5
+                        if distance < 50:  # Within 50 pixels
+                            is_duplicate = True
+                            break
+                
+                if is_duplicate:
+                    logger.debug(f"Skipping duplicate unknown face at position ({face.x}, {face.y})")
+                    continue
+            
+            unique_faces.append(face)
+        
+        if len(unique_faces) != len(face_detections):
+            logger.info(f"Removed {len(face_detections) - len(unique_faces)} duplicate faces")
+        
+        return unique_faces
+
+    def _calculate_overlap_percentage(self, x1, y1, w1, h1, x2, y2, w2, h2) -> float:
+        """Calculate overlap percentage between two rectangles"""
+        try:
+            # Calculate intersection
+            left = max(x1, x2)
+            top = max(y1, y2)
+            right = min(x1 + w1, x2 + w2)
+            bottom = min(y1 + h1, y2 + h2)
+            
+            if left < right and top < bottom:
+                intersection_area = (right - left) * (bottom - top)
+                area1 = w1 * h1
+                area2 = w2 * h2
+                union_area = area1 + area2 - intersection_area
+                
+                overlap_percentage = intersection_area / union_area if union_area > 0 else 0
+                return overlap_percentage
+            return 0.0
+        except:
+            return 0.0
+
     def _notify_callbacks(self, result: DetectionResult, frame_data: FrameData):
         """Notify all registered callbacks about detection results"""
         for callback in self.detection_callbacks:
@@ -715,10 +1097,9 @@ class FaceDetectionProcessor:
     def __del__(self):
         """Destructor"""
         self.cleanup()
-    
 
     def _assess_face_quality(self, face_region: np.ndarray, face_detection: FaceDetection) -> dict:
-        """Enhanced quality assessment including face pose"""
+        """Enhanced quality assessment with better frontal face detection"""
         quality_score = 0.0
         quality_reasons = []
         
@@ -730,20 +1111,24 @@ class FaceDetectionProcessor:
         else:
             quality_reasons.append("face_too_small")
         
-        # 2. Aspect ratio check  
+        # 2. Aspect ratio check (more strict for frontal faces)
         aspect_ratio = face_detection.width / face_detection.height
-        if 0.7 <= aspect_ratio <= 1.3:
+        if 0.8 <= aspect_ratio <= 1.2:  # More strict range for frontal faces
             quality_score += 0.2
         else:
             quality_reasons.append("abnormal_aspect_ratio")
         
-        # 3. Blur detection
-        gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY) if len(face_region.shape) == 3 else face_region
-        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if blur_score > 100:
-            quality_score += 0.2
-        else:
-            quality_reasons.append("too_blurry")
+        # 3. Blur detection (higher threshold for better quality)
+        try:
+            gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY) if len(face_region.shape) == 3 else face_region
+            blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if blur_score > 150:  # Increased from 100 for better quality
+                quality_score += 0.2
+            else:
+                quality_reasons.append("too_blurry")
+        except:
+            blur_score = 0
+            quality_reasons.append("blur_detection_failed")
         
         # 4. Detection confidence
         if face_detection.confidence > 0.7:
@@ -751,23 +1136,117 @@ class FaceDetectionProcessor:
         else:
             quality_reasons.append("low_detection_confidence")
         
-        # 5. NEW: Face pose assessment
-        pose_info = self._detect_face_pose(face_region, face_detection)
-        if pose_info['is_frontal']:
+        # 5. ENHANCED: Face pose assessment with eye/mouth detection
+        pose_info = self._detect_face_quality_enhanced(face_region)
+        if pose_info['is_frontal'] and pose_info['eyes_visible'] and pose_info['mouth_visible']:
             quality_score += 0.2
-            pose_bonus = pose_info['pose_quality'] * 0.1  # Up to 0.1 bonus for excellent pose
+            pose_bonus = pose_info['overall_quality'] * 0.1  # Up to 0.1 bonus
             quality_score += pose_bonus
         else:
-            quality_reasons.append(f"face_not_frontal_yaw_{pose_info['yaw']:.1f}_pitch_{pose_info['pitch']:.1f}")
+            quality_reasons.extend(pose_info['issues'])
         
         return {
             'quality_score': quality_score,
-            'is_good_quality': quality_score >= 0.8,  # Raised threshold due to pose requirement
+            'is_good_quality': quality_score >= 0.65,  # Slightly higher threshold
             'reasons': quality_reasons,
             'blur_score': blur_score,
             'face_area': face_area,
             'pose_info': pose_info
+        }    
+
+    def _detect_face_quality_enhanced(self, face_region: np.ndarray) -> dict:
+        """Enhanced face quality detection focusing on eyes, mouth visibility and frontality"""
+        quality_info = {
+            'is_frontal': False,
+            'eyes_visible': False,
+            'mouth_visible': False,
+            'overall_quality': 0.0,
+            'issues': []
         }
+        
+        try:
+            if face_region.size == 0:
+                quality_info['issues'].append("empty_face_region")
+                return quality_info
+            
+            gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY) if len(face_region.shape) == 3 else face_region
+            h, w = gray.shape
+            
+            # Check for minimum face size
+            if h < 120 or w < 120:
+                quality_info['issues'].append("face_too_small_for_features")
+                return quality_info
+            
+            # Detect eyes
+            eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+            eyes = eye_cascade.detectMultiScale(gray, 1.1, 4, minSize=(15, 15))
+            
+            # Detect mouth area
+            mouth_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_smile.xml')
+            mouth = mouth_cascade.detectMultiScale(gray, 1.1, 4, minSize=(20, 15))
+            
+            # Eye analysis
+            if len(eyes) >= 2:
+                quality_info['eyes_visible'] = True
+                # Sort eyes by x-coordinate
+                eyes = sorted(eyes, key=lambda x: x[0])
+                left_eye, right_eye = eyes[0], eyes[1]
+                
+                # Calculate eye symmetry for frontality
+                eye_y_diff = abs(left_eye[1] - right_eye[1])
+                eye_distance = right_eye[0] - left_eye[0]
+                
+                if eye_distance > 0:
+                    symmetry_ratio = eye_y_diff / eye_distance
+                    if symmetry_ratio < 0.15:  # Eyes are fairly level
+                        quality_info['is_frontal'] = True
+                    else:
+                        quality_info['issues'].append("face_not_frontal_tilted")
+                
+                # Check for obstructions (eyes too close to edges)
+                edge_margin = w * 0.1  # 10% margin from edges
+                if (left_eye[0] < edge_margin or 
+                    right_eye[0] + right_eye[2] > w - edge_margin):
+                    quality_info['issues'].append("eyes_near_edge_possible_obstruction")
+            else:
+                quality_info['issues'].append("insufficient_eyes_detected")
+            
+            # Mouth analysis
+            if len(mouth) > 0:
+                quality_info['mouth_visible'] = True
+                # Check if mouth is in expected position (lower half of face)
+                mouth_y = mouth[0][1]
+                if mouth_y > h * 0.5:  # Mouth in lower half
+                    pass  # Good position
+                else:
+                    quality_info['issues'].append("mouth_position_unusual")
+            else:
+                quality_info['issues'].append("mouth_not_detected")
+            
+            # Check for hand/obstruction detection (simple brightness variance)
+            try:
+                # Check upper face region for unusual brightness (possible hand obstruction)
+                upper_region = gray[0:h//3, :]
+                brightness_var = np.var(upper_region)
+                if brightness_var < 200:  # Very low variance might indicate obstruction
+                    quality_info['issues'].append("possible_obstruction_detected")
+            except:
+                pass
+            
+            # Overall quality calculation
+            quality_factors = [
+                quality_info['eyes_visible'],
+                quality_info['mouth_visible'], 
+                quality_info['is_frontal'],
+                len(quality_info['issues']) == 0
+            ]
+            quality_info['overall_quality'] = sum(quality_factors) / len(quality_factors)
+            
+        except Exception as e:
+            logger.debug(f"Enhanced face quality detection failed: {e}")
+            quality_info['issues'].append("quality_detection_error")
+        
+        return quality_info
 
     def _detect_face_pose(self, face_region: np.ndarray, face_detection: FaceDetection) -> dict:
         """
@@ -1007,7 +1486,7 @@ class FaceDetectionProcessor:
             pass
         
         return self._get_default_pose_info()
-
+    
     def _create_empty_cache_entry(self) -> dict:
         """Create empty cache entry with all fields"""
         return {
@@ -1054,44 +1533,98 @@ class FaceDetectionProcessor:
             face_embedding=None,  # Skip for performance
         )
         
- # Add this method to FaceDetectionProcessor:
-
+# Replace the _process_unknown_face method with this corrected version:
     def _process_unknown_face(self, face_roi: np.ndarray, face_detection: FaceDetection) -> bool:
-        """Process unknown face with quality control"""
-        if face_detection.is_recognized:
-            return False  # Not an unknown face
+        """Process unknown face with enhanced duplicate prevention"""
+        logger.info(f"🔎 ENTERED _process_unknown_face for {face_detection.face_id}")
         
-        # Assess quality including pose
+        # ENHANCED: Multiple duplicate checks
+        with self.unknown_processing_lock:
+            if face_detection.is_recognized:
+                logger.debug(f"Skipping {face_detection.face_id} - already recognized as {face_detection.human_name}")
+                return False
+            
+            if face_detection.face_id in self.recognition_in_progress:
+                logger.debug(f"Skipping {face_detection.face_id} - recognition in progress")
+                return False
+            
+            cached_data = self.face_cache.get(face_detection.face_id)
+            if cached_data and cached_data.is_recognized:
+                logger.debug(f"Skipping {face_detection.face_id} - cached as recognized: {cached_data.human_name}")
+                return False
+            
+            if face_detection.face_id in self.unknown_person_manager.saved_faces:
+                logger.debug(f"Skipping {face_detection.face_id} - already saved to database")
+                return False
+                
+            # ENHANCED: Check if currently being processed
+            if face_detection.face_id in self.unknown_person_manager.processing_faces:
+                logger.debug(f"Skipping {face_detection.face_id} - currently being processed")
+                return False
+        
+        # Quality assessment
         quality_assessment = self._assess_face_quality(face_roi, face_detection)
-        
-        # STRICT FRONTAL CHECK
+        logger.info(f"📊 QUALITY ASSESSMENT for {face_detection.face_id}: score={quality_assessment['quality_score']:.2f}, "
+                    f"good_quality={quality_assessment['is_good_quality']}, frontal={quality_assessment.get('pose_info', {}).get('is_frontal', False)}")
+
+        # Check if frontal
         pose_info = quality_assessment.get('pose_info', {})
         if not pose_info.get('is_frontal', False):
-            logger.debug(f"Skipping {face_detection.face_id} - not frontal: "
-                        f"yaw={pose_info.get('yaw', 0):.1f}°, "
-                        f"pitch={pose_info.get('pitch', 0):.1f}°")
+            logger.info(f"❌ REJECTING {face_detection.face_id} - not frontal pose")
             return False
         
-        # Check if we should capture this face (pass recognition status)
-        if not self.unknown_person_manager.should_capture_unknown_face(
-            face_detection.face_id, quality_assessment, face_detection.is_recognized
-        ):
-            return False
-        
-        # If quality is good, save the face image
-        if quality_assessment['is_good_quality']:
-            self.unknown_person_manager.add_face_image(
-                face_detection.face_id, face_roi, quality_assessment
+        # Check if we should capture this face
+        with self.unknown_processing_lock:
+            should_capture = self.unknown_person_manager.should_capture_unknown_face(
+                face_detection.face_id, quality_assessment, face_detection.is_recognized
             )
-            logger.info(f"Captured high-quality unknown face {face_detection.face_id} "
-                    f"(quality: {quality_assessment['quality_score']:.2f})")
+            logger.info(f"📋 CAPTURE DECISION for {face_detection.face_id}: should_capture={should_capture}")
+            
+            if not should_capture:
+                logger.info(f"❌ REJECTING {face_detection.face_id} - should not capture")
+                return False
         
-        # Check if we're ready to save to database
-        if self.unknown_person_manager.is_ready_for_database(face_detection.face_id):
-            return self._save_unknown_person_to_database(face_detection.face_id)
+        # Save face image if good quality
+        if quality_assessment['is_good_quality']:
+            self.unknown_person_manager.add_face_image(face_detection.face_id, face_roi, quality_assessment)
+            logger.info(f"✅ CAPTURED high-quality unknown face {face_detection.face_id}")
+        
+        # Database save check
+        with self.unknown_processing_lock:
+            # Re-check recognition status
+            cached_data = self.face_cache.get(face_detection.face_id)
+            if cached_data and cached_data.is_recognized:
+                logger.info(f"STOPPING: {face_detection.face_id} was recognized as {cached_data.human_name} during processing")
+                self.unknown_person_manager.cleanup_face(face_detection.face_id)
+                return False
+            
+            # Check if ready for database
+            is_ready = self.unknown_person_manager.is_ready_for_database(face_detection.face_id)
+            
+            if is_ready:
+                logger.info(f"🚀 STARTING DATABASE SAVE for {face_detection.face_id}")
+                
+                # ENHANCED: Mark as being processed
+                self.unknown_person_manager.mark_processing_start(face_detection.face_id)
+                
+                # Save to database
+                try:
+                    result = self._save_unknown_person_to_database(face_detection.face_id)
+                    logger.info(f"📝 DATABASE SAVE RESULT for {face_detection.face_id}: {result}")
+                    
+                    # Mark processing end
+                    self.unknown_person_manager.mark_processing_end(face_detection.face_id, success=result)
+                    
+                    return result
+                except Exception as e:
+                    logger.error(f"❌ DATABASE SAVE ERROR for {face_detection.face_id}: {e}")
+                    self.unknown_person_manager.mark_processing_end(face_detection.face_id, success=False)
+                    return False
+            else:
+                logger.info(f"⏸️ NOT READY for database yet: {face_detection.face_id}")
         
         return False
-    
+
     def _save_unknown_person_to_database(self, face_id: str) -> bool:
         """Save unknown person: best image -> UCode -> create human -> save face embedding"""
         import os, json, requests
@@ -1278,106 +1811,184 @@ class FaceDetectionProcessor:
                 logger.warning(f"Failed to save success metadata for {face_id}: {e}")
                 # Don't fail the whole process for this
             
+            
+            if face_id in self.face_cache:
+                cached_data = self.face_cache[face_id]
+                # Reset recognition status to force fresh check
+                cached_data.is_recognized = False
+                cached_data.last_update = 0  # Force immediate update
+                logger.info(f"Reset cache for {face_id} to force recognition check") 
+            
+            if hasattr(self.face_recognizer, 'embedding_cache') and face_id in self.face_recognizer.embedding_cache:
+                del self.face_recognizer.embedding_cache[face_id]
+                logger.info(f"Cleared embedding cache for {face_id}")
+            
             # Mark as saved to prevent duplicate saves
             self.unknown_person_manager.saved_faces.add(face_id)
-            logger.info(f"Successfully completed full pipeline for unknown person {face_id}")
+            logger.info(f"✅ Successfully completed full pipeline for unknown person {face_id}")            
             
             # Clean up after processing
-            self.unknown_person_manager.cleanup_face(face_id)
+            # self.unknown_person_manager.cleanup_face(face_id)
             return True
             
         except Exception as e:
             logger.error(f"Error in save pipeline for unknown person {face_id}: {e}")
             return False
     
+
     def _make_json_serializable(self, obj):
-            """Convert object to JSON-serializable format"""
-            if isinstance(obj, dict):
-                return {key: self._make_json_serializable(value) for key, value in obj.items()}
-            elif isinstance(obj, list):
-                return [self._make_json_serializable(item) for item in obj]
-            elif isinstance(obj, (np.bool_, bool)):
-                return bool(obj)
-            elif isinstance(obj, (np.int32, np.int64, int)):
-                return int(obj)
-            elif isinstance(obj, (np.float32, np.float64, float)):
-                return float(obj)
-            else:
-                return str(obj)
+        """Convert object to JSON-serializable format - FIXED"""
+        if isinstance(obj, dict):
+            return {key: self._make_json_serializable(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._make_json_serializable(item) for item in obj]
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        elif isinstance(obj, (np.int32, np.int64, int)):
+            return int(obj)
+        elif isinstance(obj, (np.float32, np.float64, float)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()  # Convert numpy arrays to lists
+        else:
+            return str(obj)
 
 class UnknownPersonManager:
     """Manages unknown face detection and quality assessment"""
     
-    def __init__(self, config:AppConfig):
+    def __init__(self, config: AppConfig):
         self.unknown_faces_buffer = {}  # face_id -> list of quality assessments
         self.capture_attempts = {}      # face_id -> attempt count
         self.unknown_face_images = {}   # face_id -> list of face images
         self.face_first_seen = {}  # face_id -> timestamp
-        self.recognition_grace_period = 3.0
+        self.recognition_grace_period = 1.5  # Seconds to wait before processing unknown faces
+        
+        # ENHANCED: Duplicate prevention
+        self.processing_faces = set()  # Currently being processed
+        self.recently_saved = {}       # face_id -> timestamp of save
+        self.save_cooldown = 300       # 5 minutes cooldown between saves
         
         # Configuration
         self.max_attempts = getattr(config.detection, 'UNKNOWN_FACE_MAX_ATTEMPTS', 5)
         self.min_good_captures = getattr(config.detection, 'UNKNOWN_FACE_MIN_CAPTURES', 2)
-        self.min_quality_score = getattr(config.detection, 'UNKNOWN_FACE_MIN_QUALITY', 0.75)
+        self.min_quality_score = getattr(config.detection, 'UNKNOWN_FACE_MIN_QUALITY', 0.65)
         self.require_frontal = getattr(config.detection, 'UNKNOWN_FACE_REQUIRE_FRONTAL', True)
         self.saved_faces = set()  
         
-        logger.info(f"UnknownPersonManager initialized: max_attempts={self.max_attempts}, "
-                   f"min_captures={self.min_good_captures}, min_quality={self.min_quality_score}")
+        logger.info(f"UnknownPersonManager initialized with enhanced duplicate prevention: "
+                f"max_attempts={self.max_attempts}, min_captures={self.min_good_captures}, "
+                f"min_quality={self.min_quality_score}, grace_period={self.recognition_grace_period}s, "
+                f"save_cooldown={self.save_cooldown}s")
     
-    def should_capture_unknown_face(self, face_id: str, quality_assessment: dict, is_currently_recognized: bool = False) -> bool:        
-        """Decide whether to capture this unknown face"""
+    
+    def get_face_recognition_status(self, face_id: str) -> dict:
+        """Debug method to check face recognition status"""
+        cached_data = self.face_cache.get(face_id)
+        if not cached_data:
+            return {"error": "Face not found in cache"}
+        
+        return {
+            "face_id": face_id,
+            "is_recognized": cached_data.is_recognized,
+            "human_name": cached_data.human_name,
+            "human_guid": cached_data.human_guid,
+            "recognition_confidence": cached_data.recognition_confidence,
+            "last_update": cached_data.last_update,
+            "update_count": cached_data.update_count,
+            "in_saved_faces": face_id in self.unknown_person_manager.saved_faces
+        }
+
+    def should_capture_unknown_face(self, face_id: str, quality_assessment: dict, is_currently_recognized: bool = False) -> bool:
+        """Enhanced duplicate prevention for unknown face capture"""
         current_time = time.time()
         
+        logger.info(f"📋 CHECKING should_capture for {face_id}: recognized={is_currently_recognized}")
+        
+        # ENHANCED: Multiple duplicate checks
         if is_currently_recognized:
+            logger.debug(f"❌ Skipping {face_id} - currently recognized")
             return False
-    
+        
+        # Check if already saved
+        if face_id in self.saved_faces:
+            logger.info(f"❌ Skipping {face_id} - already saved to database")
+            return False
+            
+        # ENHANCED: Check recent save cooldown
+        if face_id in self.recently_saved:
+            time_since_save = current_time - self.recently_saved[face_id]
+            if time_since_save < self.save_cooldown:
+                logger.info(f"❌ Skipping {face_id} - recent save cooldown ({time_since_save:.1f}s)")
+                return False
+        
+        # ENHANCED: Check if currently being processed
+        if face_id in self.processing_faces:
+            logger.info(f"❌ Skipping {face_id} - currently being processed")
+            return False
+
         # Track when this face was first seen
         if face_id not in self.face_first_seen:
             self.face_first_seen[face_id] = current_time
+            logger.info(f"🆕 First time seeing {face_id}")
         
-        # Give recognition system time to work (grace period)
+        # Give recognition system time to work
         time_since_first_seen = current_time - self.face_first_seen[face_id]
+        logger.info(f"⏰ {face_id} time since first seen: {time_since_first_seen:.1f}s (grace: {self.recognition_grace_period}s)")
+        
         if time_since_first_seen < self.recognition_grace_period:
-            logger.info(f"Face {face_id} still in recognition grace period "
-                        f"({time_since_first_seen:.1f}s < {self.recognition_grace_period}s)")
+            logger.info(f"⏳ {face_id} still in grace period")
             return False
         
-        #delete from first time seen to free memory after human is out of first time seen grace period
-        # if face_id in self.face_first_seen:
-        #     del self.face_first_seen[face_id]
+        logger.info(f"✅ {face_id} passed grace period, proceeding with capture checks")
         
         # Initialize tracking for new face
         if face_id not in self.unknown_faces_buffer:
             self.unknown_faces_buffer[face_id] = []
             self.capture_attempts[face_id] = 0
             self.unknown_face_images[face_id] = []
+            logger.info(f"🆕 Initialized tracking for {face_id}")
         
-        # Check if we've exceeded max attempts
+        # Check limits
         if self.capture_attempts[face_id] >= self.max_attempts:
+            logger.info(f"❌ {face_id} exceeded max attempts ({self.capture_attempts[face_id]}/{self.max_attempts})")
             return False
         
-        # Count good quality captures so far
         good_captures = len([q for q in self.unknown_faces_buffer[face_id] if q['is_good_quality']])
-        
-        # If we have enough good captures, stop
         if good_captures >= self.min_good_captures:
+            logger.info(f"❌ {face_id} has enough good captures ({good_captures}/{self.min_good_captures})")
             return False
         
         # Check pose requirement
         pose_info = quality_assessment.get('pose_info', {})
         if self.require_frontal and not pose_info.get('is_frontal', False):
-            logger.debug(f"Skipping unknown face {face_id} - not frontal "
-                        f"(yaw: {pose_info.get('yaw', 0):.1f}°)")
+            logger.info(f"❌ {face_id} not frontal pose")
             return False
         
         # Increment attempt counter
         self.capture_attempts[face_id] += 1
         self.unknown_faces_buffer[face_id].append(quality_assessment)
         
-        # Capture if quality is good
-        return quality_assessment['is_good_quality']
-    
+        # Check if this capture has good quality
+        is_good_quality = quality_assessment.get('is_good_quality', False)
+        logger.info(f"✅ {face_id} should capture: good_quality={is_good_quality}, attempt={self.capture_attempts[face_id]}")
+        
+        return is_good_quality    
+
+    def mark_processing_start(self, face_id: str):
+        """Mark face as being processed"""
+        self.processing_faces.add(face_id)
+        logger.debug(f"Marked {face_id} as being processed")
+
+    def mark_processing_end(self, face_id: str, success: bool = False):
+        """Mark face processing as completed"""
+        self.processing_faces.discard(face_id)
+        if success:
+            self.saved_faces.add(face_id)
+            self.recently_saved[face_id] = time.time()
+            logger.info(f"Marked {face_id} as successfully saved")
+        else:
+            logger.debug(f"Marked {face_id} processing as completed (failed)")
+            
     def add_face_image(self, face_id: str, face_image: np.ndarray, quality_assessment: dict):
         """Store a high-quality face image"""
         if face_id in self.unknown_face_images:
