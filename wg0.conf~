@@ -1,9 +1,0 @@
-[Interface]
-PrivateKey = SLh79RK0pjmcF5dbE2HX9gruSc9cjfd5RDVR5cxiJ3I=
-Address = 192.168.94.12/32
-
-[Peer]
-PublicKey = vpryax34TLklfuFvRyjbuTOndMFZ7HesTM1nknZwLi8=
-AllowedIPs = 192.168.150.0/24, 192.168.151.0/24, 10.0.14.0/24, 10.0.3.0/24, 10.0.12.0/24, 10.0.34.0/24
-Endpoint = 95.46.80.1:13231
-PersistentKeepalive = 10

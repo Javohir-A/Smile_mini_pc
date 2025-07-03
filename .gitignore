@@ -3,3 +3,5 @@
 # Python cache files
 __pycache__/
 *.py[cod]
+wg0.conf
+wg0.conf~
