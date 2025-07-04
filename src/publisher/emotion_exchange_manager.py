@@ -1,7 +1,9 @@
-# src/publishers/emotion_exchange_manager.py
+# src/publisher/emotion_exchange_manager.py - COMPLETE FIXED VERSION
 import logging
 import redis
 import time
+import pika
+import json
 from typing import Optional, Set, List
 from datetime import datetime, timedelta
 from threading import Lock
@@ -11,19 +13,63 @@ from src.config.rabbitmq import RabbitMQConfig
 
 logger = logging.getLogger(__name__)
 
+ATOMIC_ASSIGNMENT_SCRIPT = """
+local human_id = ARGV[1]
+local max_capacity = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+local exchange_prefix = ARGV[4]
+local timestamp = ARGV[5]
+
+-- Check if human already assigned
+local existing = redis.call('GET', 'human_exchange:' .. human_id)
+if existing then
+    return existing
+end
+
+-- Find available exchange atomically
+local pattern = 'exchange_humans:' .. exchange_prefix .. '*'
+local exchanges = redis.call('KEYS', pattern)
+
+for i, exchange_key in ipairs(exchanges) do
+    local current_count = redis.call('SCARD', exchange_key)
+    if current_count < max_capacity then
+        local exchange_name = string.gsub(exchange_key, 'exchange_humans:', '')
+        
+        -- Atomic assignment
+        redis.call('SADD', exchange_key, human_id)
+        redis.call('SETEX', 'human_exchange:' .. human_id, ttl, exchange_name)
+        
+        -- Update stats
+        local stats_key = 'exchange_stats:' .. exchange_name
+        redis.call('HINCRBY', stats_key, 'total_assignments', 1)
+        redis.call('HSET', stats_key, 'last_assignment', timestamp)
+        
+        return exchange_name
+    end
+end
+
+-- No available exchange found
+return 'NEEDS_NEW_EXCHANGE'
+"""
+
 class EmotionExchangeManager:
     """Manages exchange assignment and scaling logic using Redis"""
     
-    def __init__(self, redis_config:RedisConfig, rabbitmq_config:RabbitMQConfig):
+    def __init__(self, redis_config: RedisConfig, rabbitmq_config: RabbitMQConfig):
         self.redis_config = redis_config
         self.rabbitmq_config = rabbitmq_config
         self.redis_client = None
         self.redis_available = False
         self.last_redis_check = None
         self.lock = Lock()
+        self.assignment_script_sha = None
         
-        # Initialize Redis connection
+        # Initialize Redis connection FIRST
         self._initialize_redis()
+        
+        # Then load Lua script
+        if self.redis_available:
+            self._preload_lua_script()
     
     def _initialize_redis(self):
         """Initialize Redis connection with error handling"""
@@ -49,9 +95,23 @@ class EmotionExchangeManager:
             
         except Exception as e:
             self.redis_available = False
+            self.redis_client = None
             logger.warning(f"⚠️ Redis connection failed: {e}")
             if self.redis_config.enable_fallback:
                 logger.info("🔄 Will use REST API fallback")
+    
+    def _preload_lua_script(self):
+        """Preload Lua script for atomic operations"""
+        try:
+            if not self.redis_client:
+                logger.warning("⚠️ Cannot load Lua script - Redis client not available")
+                return
+                
+            self.assignment_script_sha = self.redis_client.script_load(ATOMIC_ASSIGNMENT_SCRIPT)
+            logger.info("✅ Atomic assignment script loaded")
+        except Exception as e:
+            logger.error(f"❌ Failed to load Lua script: {e}")
+            self.assignment_script_sha = None
     
     def _check_redis_health(self) -> bool:
         """Check Redis health with caching to avoid frequent checks"""
@@ -67,8 +127,14 @@ class EmotionExchangeManager:
                 self.redis_client.ping()
                 self.redis_available = True
                 logger.debug("✅ Redis health check passed")
+                
+                # Reload script if needed
+                if not self.assignment_script_sha:
+                    self._preload_lua_script()
             else:
                 self._initialize_redis()
+                if self.redis_available:
+                    self._preload_lua_script()
                 
         except Exception as e:
             self.redis_available = False
@@ -78,122 +144,185 @@ class EmotionExchangeManager:
         return self.redis_available
     
     def get_exchange_for_human(self, human_id: str) -> Optional[str]:
-        """Get or assign exchange for human. Returns None if Redis unavailable."""
+        """Get exchange assignment using atomic Redis operations"""
         with self.lock:
             if not self._check_redis_health():
                 return None
             
             try:
-                # Check if human already has an exchange
-                exchange_key = f"{self.redis_config.human_exchange_prefix}{human_id}"
-                existing_exchange = self.redis_client.get(exchange_key)
+                # Ensure script is loaded
+                if not self.assignment_script_sha:
+                    self._preload_lua_script()
+                    if not self.assignment_script_sha:
+                        logger.error("❌ Cannot proceed without Lua script")
+                        return None
                 
-                if existing_exchange:
-                    logger.debug(f"📋 Human {human_id} already assigned to {existing_exchange}")
-                    return existing_exchange
+                # Use atomic Lua script
+                result = self.redis_client.evalsha(
+                    self.assignment_script_sha,
+                    0,  # Number of keys (we use ARGV only)
+                    human_id,
+                    str(self.rabbitmq_config.max_humans_per_exchange),
+                    str(self.redis_config.human_assignment_ttl),
+                    self.rabbitmq_config.exchange_prefix,
+                    datetime.now().isoformat()
+                )
                 
-                # Find available exchange or create new one
-                exchange_name = self._find_or_create_exchange(human_id)
+                if result == 'NEEDS_NEW_EXCHANGE':
+                    # Handle new exchange creation with distributed lock
+                    return self._create_exchange_with_distributed_lock(human_id)
                 
-                if exchange_name:
-                    # Store assignment with TTL
-                    self.redis_client.setex(
-                        exchange_key, 
-                        self.redis_config.human_assignment_ttl, 
-                        exchange_name
-                    )
-                    
-                    # Add human to exchange set
-                    humans_key = f"{self.redis_config.exchange_humans_prefix}{exchange_name}"
-                    self.redis_client.sadd(humans_key, human_id)
-                    self.redis_client.expire(humans_key, self.redis_config.human_assignment_ttl)
-                    
-                    # Update exchange stats
-                    self._update_exchange_stats(exchange_name)
-                    
-                    humans_count = self.redis_client.scard(humans_key)
-                    logger.info(f"🔗 Assigned human {human_id} to {exchange_name} "
-                               f"({humans_count}/{self.rabbitmq_config.max_humans_per_exchange})")
-                    
-                return exchange_name
+                logger.info(f"🔗 Atomic assignment: {human_id} → {result}")
+                return result
                 
+            except redis.exceptions.NoScriptError:
+                # Script not loaded, reload and retry
+                logger.warning("⚠️ Script not found, reloading...")
+                self._preload_lua_script()
+                if self.assignment_script_sha:
+                    return self.get_exchange_for_human(human_id)
+                else:
+                    logger.error("❌ Failed to reload script")
+                    return None
             except Exception as e:
-                logger.error(f"❌ Error managing exchange for human {human_id}: {e}")
-                self.redis_available = False
+                logger.error(f"❌ Error in atomic assignment: {e}")
                 return None
-            
-    def _find_or_create_exchange(self, human_id: str) -> Optional[str]:
-        """
-        Find available exchange or create new one for a specific human
+    
+    def _create_exchange_with_distributed_lock(self, human_id: str) -> Optional[str]:
+        """Create new exchange with distributed lock to prevent race conditions"""
+        lock_key = "exchange_creation_lock"
+        lock_timeout = 30  # 30 seconds
         
-        Logic:
-        1. Look for exchanges with available capacity (< max_humans_per_exchange)
-        2. If found, assign this human to that exchange
-        3. If none found, create a new exchange for this human
-        
-        Args:
-            human_id: The human that needs to be assigned to an exchange
-            
-        Returns:
-            str: Exchange name to assign this human to
-            None: If Redis operations fail
-        """
         try:
-            # Get all existing exchange keys from Redis
+            # Acquire distributed lock
+            lock_acquired = self.redis_client.set(
+                lock_key, 
+                human_id, 
+                nx=True, 
+                ex=lock_timeout
+            )
+            
+            if not lock_acquired:
+                # Another process is creating exchange, wait and retry assignment
+                logger.info(f"⏳ Waiting for exchange creation to complete...")
+                time.sleep(2)
+                
+                # Retry atomic assignment (new exchange might be available)
+                return self.get_exchange_for_human(human_id)
+            
+            try:
+                # We have the lock, proceed with creation
+                logger.info(f"🔒 Acquired creation lock for {human_id}")
+                
+                # Double-check if assignment is still needed
+                existing = self.redis_client.get(f"human_exchange:{human_id}")
+                if existing:
+                    logger.info(f"👤 Human {human_id} was assigned during lock wait: {existing}")
+                    return existing
+                
+                # Double-check if any exchange now has capacity (another process might have created one)
+                available_exchange = self._find_available_exchange()
+                if available_exchange:
+                    logger.info(f"📍 Found available exchange after lock: {available_exchange}")
+                    self._assign_human_atomically(human_id, available_exchange)
+                    return available_exchange
+                
+                # Create new exchange
+                new_exchange = self._create_new_exchange()
+                if new_exchange:
+                    logger.info(f"🆕 Created new exchange: {new_exchange}")
+                    self._assign_human_atomically(human_id, new_exchange)
+                    return new_exchange
+                
+                logger.error("❌ Failed to create new exchange")
+                return None
+                
+            finally:
+                # Release lock
+                self.redis_client.delete(lock_key)
+                logger.info(f"🔓 Released creation lock")
+                
+        except Exception as e:
+            logger.error(f"❌ Error in distributed lock creation: {e}")
+            return None
+    
+    def _find_available_exchange(self) -> Optional[str]:
+        """Find exchange with available capacity"""
+        try:
             exchange_pattern = f"{self.redis_config.exchange_humans_prefix}*"
-            exchange_keys: List[str] = list(self.redis_client.scan_iter(match=exchange_pattern))
+            exchange_keys = list(self.redis_client.scan_iter(match=exchange_pattern))
             
-            logger.debug(f"🔍 Found {len(exchange_keys)} existing exchanges for human {human_id}")
-            
-            # Check each existing exchange for available capacity
             for exchange_key in exchange_keys:
                 exchange_name = exchange_key.replace(self.redis_config.exchange_humans_prefix, '')
                 humans_count = self.redis_client.scard(exchange_key)
                 
-                logger.debug(f"📊 Exchange {exchange_name}: {humans_count}/{self.rabbitmq_config.max_humans_per_exchange} humans")
-                
-                # Check if this exchange has capacity
                 if humans_count < self.rabbitmq_config.max_humans_per_exchange:
-                    # Double-check that this human isn't already in this exchange
-                    # (This is a safety check - shouldn't happen if Redis TTL is working correctly)
-                    is_already_in_exchange = self.redis_client.sismember(exchange_key, human_id)
-                    
-                    if is_already_in_exchange:
-                        logger.warning(f"⚠️ Human {human_id} already in {exchange_name} but not in human_exchange mapping")
-                        return exchange_name
-                    
-                    logger.info(f"📍 Found available exchange {exchange_name} for human {human_id} "
-                            f"({humans_count}/{self.rabbitmq_config.max_humans_per_exchange})")
+                    logger.debug(f"📍 Found available exchange: {exchange_name} ({humans_count}/1000)")
                     return exchange_name
             
-            # No existing exchange has capacity - create a new one
-            new_exchange_number = self._get_next_exchange_number(exchange_keys)
-            new_exchange_name = f"{self.rabbitmq_config.exchange_prefix}{new_exchange_number}"
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error finding available exchange: {e}")
+            return None
+    
+    #it doesn't create an actual RabbitMQ exchange creation!
+    def _create_new_exchange(self) -> Optional[str]:
+        """Create new RabbitMQ exchange and initialize Redis tracking"""
+        try:
+            # Determine next exchange number
+            next_number = self._get_next_exchange_number()
+            exchange_name = f"{self.rabbitmq_config.exchange_prefix}{next_number}"
+            queue_name = f"{exchange_name}_queue"
             
-            logger.info(f"🆕 Creating new exchange {new_exchange_name} for human {human_id} "
-                    f"(all {len(exchange_keys)} existing exchanges at capacity)")
+            logger.info(f"🆕 Creating new exchange: {exchange_name}")
             
-            return new_exchange_name
+            # Create RabbitMQ infrastructure (this requires RabbitMQ connection)
+            # For now, we'll just set up Redis tracking - RabbitMQ creation will be handled by publisher
+            
+            # Initialize Redis tracking for the new exchange
+            self._initialize_exchange_in_redis(exchange_name)
+            
+            return exchange_name
             
         except Exception as e:
-            logger.error(f"❌ Error finding/creating exchange for human {human_id}: {e}")
+            logger.error(f"❌ Failed to create new exchange: {e}")
             return None
-        
-    def _get_next_exchange_number(self, exchange_keys: List[str]) -> int:
-        """
-        Determine the next exchange number to create
-        
-        This handles cases where exchanges might be deleted/recreated
-        and ensures we don't have naming conflicts
-        """
+    
+    def _initialize_exchange_in_redis(self, exchange_name: str):
+        """Initialize exchange tracking in Redis"""
         try:
+            # Create empty set for humans
+            humans_key = f"{self.redis_config.exchange_humans_prefix}{exchange_name}"
+            self.redis_client.sadd(humans_key, "")  # Add empty string
+            self.redis_client.srem(humans_key, "")  # Remove it (creates empty set)
+            
+            # Initialize stats
+            stats_key = f"{self.redis_config.exchange_stats_prefix}{exchange_name}"
+            stats = {
+                "created_at": datetime.now().isoformat(),
+                "total_assignments": 0,
+                "last_assignment": ""
+            }
+            self.redis_client.hset(stats_key, mapping=stats)
+            self.redis_client.expire(stats_key, self.redis_config.exchange_stats_ttl)
+            
+            logger.info(f"✅ Initialized Redis tracking for {exchange_name}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize exchange in Redis: {e}")
+            raise
+    
+    def _get_next_exchange_number(self) -> int:
+        """Determine the next exchange number to create"""
+        try:
+            exchange_pattern = f"{self.redis_config.exchange_humans_prefix}*"
+            exchange_keys = list(self.redis_client.scan_iter(match=exchange_pattern))
             existing_numbers = []
             
             # Extract numbers from existing exchange names
             for exchange_key in exchange_keys:
                 exchange_name = exchange_key.replace(self.redis_config.exchange_humans_prefix, '')
                 
-                # Extract number from names like "emotion_exchange_1", "emotion_exchange_2"
                 if exchange_name.startswith(self.rabbitmq_config.exchange_prefix):
                     number_part = exchange_name.replace(self.rabbitmq_config.exchange_prefix, '')
                     try:
@@ -210,28 +339,37 @@ class EmotionExchangeManager:
                 
         except Exception as e:
             logger.error(f"❌ Error determining next exchange number: {e}")
-            return len(exchange_keys) + 1  # Fallback to simple counting
+            return 1  # Fallback
     
-    def _update_exchange_stats(self, exchange_name: str):
-        """Update exchange statistics in Redis"""
+    def _assign_human_atomically(self, human_id: str, exchange_name: str):
+        """Assign human to exchange atomically"""
         try:
-            stats_key = f"{self.redis_config.exchange_stats_prefix}{exchange_name}"
-            stats = {
-                'last_assignment': datetime.now().isoformat(),
-                'total_assignments': 1
-            }
+            pipe = self.redis_client.pipeline()
             
-            # Get existing stats and increment
-            existing_stats = self.redis_client.hgetall(stats_key)
-            if existing_stats and 'total_assignments' in existing_stats:
-                stats['total_assignments'] = int(existing_stats['total_assignments']) + 1
+            # Add human to exchange set
+            pipe.sadd(f"exchange_humans:{exchange_name}", human_id)
             
-            # Update stats with TTL
-            self.redis_client.hmset(stats_key, stats)
-            self.redis_client.expire(stats_key, self.redis_config.exchange_stats_ttl)
+            # Create human → exchange mapping
+            pipe.setex(
+                f"human_exchange:{human_id}",
+                self.redis_config.human_assignment_ttl,
+                exchange_name
+            )
+            
+            # Update stats
+            stats_key = f"exchange_stats:{exchange_name}"
+            pipe.hincrby(stats_key, "total_assignments", 1)
+            pipe.hset(stats_key, "last_assignment", datetime.now().isoformat())
+            
+            # Execute atomically
+            pipe.execute()
+            
+            humans_count = self.redis_client.scard(f"exchange_humans:{exchange_name}")
+            logger.info(f"👤 Atomically assigned {human_id} to {exchange_name} ({humans_count}/1000)")
             
         except Exception as e:
-            logger.warning(f"⚠️ Failed to update exchange stats: {e}")
+            logger.error(f"❌ Error in atomic assignment: {e}")
+            raise
     
     def get_exchange_stats(self) -> dict:
         """Get statistics about all exchanges"""

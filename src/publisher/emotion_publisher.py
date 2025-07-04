@@ -96,6 +96,7 @@ class EmotionPublisher:
             logger.error(f"❌ RabbitMQ publish error: {e}")
     
             return False
+        
     def _fallback_to_rest_api(self, emotion_data: Dict[str, Any]) -> bool:
         """Fallback to REST API"""
         try:
