@@ -69,21 +69,48 @@ class EmotionRabbitMQPublisher:
                 logger.warning(f"⚠️ RabbitMQ connection failed: {e}")
     
     def _ensure_exchange(self, exchange_name: str):
-        """Ensure exchange exists"""
+        """Ensure exchange AND its queue exist with proper binding"""
         try:
-            if self.channel:
-                self.channel.exchange_declare(
-                    exchange=exchange_name,
-                    exchange_type=self.config.exchange_type,
-                    durable=self.config.exchange_durable
-                )
-                logger.debug(f"📡 Ensured exchange exists: {exchange_name}")
+            if not self.channel:
+                return
+            
+            logger.info(f"🏗️ Setting up complete infrastructure for {exchange_name}")
+            
+            # Step 1: Declare exchange
+            self.channel.exchange_declare(
+                exchange=exchange_name,
+                exchange_type=self.config.exchange_type,  # 'direct'
+                durable=self.config.exchange_durable      # True
+            )
+            logger.debug(f"✅ Exchange declared: {exchange_name}")
+            
+            # Step 2: Declare corresponding queue
+            queue_name = f"{exchange_name}_queue"
+            self.channel.queue_declare(
+                queue=queue_name,
+                durable=self.config.queue_durable  # True - survives restart
+            )
+            logger.debug(f"✅ Queue declared: {queue_name}")
+            
+            # Step 3: Bind queue to exchange
+            self.channel.queue_bind(
+                exchange=exchange_name,
+                queue=queue_name,
+                routing_key=self.config.routing_key  # 'emotion'
+            )
+            logger.debug(f"✅ Queue bound: {queue_name} → {exchange_name} (key: {self.config.routing_key})")
+            
+            logger.info(f"🎉 Complete setup for {exchange_name}:")
+            logger.info(f"   Exchange: {exchange_name}")
+            logger.info(f"   Queue: {queue_name}")
+            logger.info(f"   Binding: {self.config.routing_key}")
+            
         except Exception as e:
-            logger.error(f"❌ Failed to ensure exchange {exchange_name}: {e}")
+            logger.error(f"❌ Failed to setup infrastructure for {exchange_name}: {e}")
             raise
-    
+        
     def publish_emotion(self, exchange_name: str, emotion_data: Dict[str, Any]) -> bool:
-        """Publish emotion message to specific exchange"""
+        """Publish emotion message with complete infrastructure verification"""
         with self.lock:
             # Check connection
             if not self.is_connected or not self.channel:
@@ -93,8 +120,13 @@ class EmotionRabbitMQPublisher:
                 return False
             
             try:
-                # Ensure exchange exists
+                # Ensure complete infrastructure (exchange + queue + binding)
                 self._ensure_exchange(exchange_name)
+                
+                # Verify setup worked
+                if not self.verify_setup(exchange_name):
+                    logger.error(f"❌ Infrastructure verification failed for {exchange_name}")
+                    return False
                 
                 # Prepare message
                 message_body = json.dumps(emotion_data, default=str)
@@ -108,23 +140,66 @@ class EmotionRabbitMQPublisher:
                     app_id='emotion_processor'
                 )
                 
-                # Publish message
+                # Publish message to EXCHANGE (not directly to queue!)
                 self.channel.basic_publish(
-                    exchange=exchange_name,
-                    routing_key=self.config.routing_key,
+                    exchange=exchange_name,           # Send TO exchange
+                    routing_key=self.config.routing_key,  # 'emotion' - routing instruction
                     body=message_body,
                     properties=properties
                 )
                 
-                logger.info(f"📤 Published emotion to {exchange_name}: "
-                           f"{emotion_data.get('human_name', 'Unknown')} - "
-                           f"{emotion_data.get('emotion_type', 'Unknown')}")
+                logger.info(f"📤 Published to EXCHANGE '{exchange_name}' with routing key '{self.config.routing_key}': "
+                        f"{emotion_data.get('human_name', 'Unknown')} - "
+                        f"{emotion_data.get('emotion_type', 'Unknown')}")
+                
+                # Log the flow for clarity
+                queue_name = f"{exchange_name}_queue"
+                logger.debug(f"🔄 Message flow: Publisher → {exchange_name} → {queue_name} → Consumer")
+                
                 return True
                 
             except Exception as e:
                 logger.error(f"❌ Failed to publish to {exchange_name}: {e}")
                 self.is_connected = False
                 return False
+            
+    def verify_setup(self, exchange_name: str) -> bool:
+        """Verify that exchange, queue, and binding are properly set up"""
+        try:
+            if not self.channel:
+                return False
+            
+            queue_name = f"{exchange_name}_queue"
+            
+            # Test that we can declare (passive=True means check existence only)
+            try:
+                # Check exchange exists
+                self.channel.exchange_declare(
+                    exchange=exchange_name,
+                    exchange_type=self.config.exchange_type,
+                    durable=self.config.exchange_durable,
+                    passive=True  # Only check, don't create
+                )
+                
+                # Check queue exists
+                method = self.channel.queue_declare(
+                    queue=queue_name,
+                    durable=self.config.queue_durable,
+                    passive=True  # Only check, don't create
+                )
+                
+                message_count = method.method.message_count
+                logger.debug(f"📊 {queue_name}: {message_count} messages waiting")
+                
+                return True
+                
+            except Exception as verify_error:
+                logger.warning(f"⚠️ Setup verification failed for {exchange_name}: {verify_error}")
+                return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error verifying setup for {exchange_name}: {e}")
+            return False
     
     def is_healthy(self) -> bool:
         """Check if publisher is healthy"""
