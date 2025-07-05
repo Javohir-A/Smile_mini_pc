@@ -6,3 +6,4 @@ __pycache__/
 wg0.conf
 wg0.conf~
 storage
+/temp_videos
