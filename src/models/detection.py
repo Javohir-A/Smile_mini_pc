@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 @dataclass
 class FaceRecognition:
@@ -55,3 +55,51 @@ class ProcessedFace:
     @property
     def dominant_emotion(self) -> str:
         return self.emotion.dominant_emotion
+
+
+@dataclass
+class FaceDetection:
+    """Represents a detected face with recognition info"""
+    x: int
+    y: int
+    width: int
+    height: int
+    confidence: float
+    landmarks: Optional[List[tuple]] = None
+    emotion: Optional[str] = None
+    emotion_confidence: Optional[float] = None
+    emotion_probabilities: Optional[Dict[str, float]] = None
+    face_id: Optional[str] = None
+    recognition_confidence: Optional[float] = None
+
+    human_guid: Optional[str] = None
+    human_name: Optional[str] = None
+    human_type: Optional[str] = None
+    is_recognized: bool = False
+    face_embedding: Optional[List[float]] = None
+    pose_info: Optional[dict] = None  # ADD THIS LINE
+    
+    
+
+@dataclass
+class DetectionResult:
+    """Result of face detection processing"""
+    stream_id: str
+    timestamp: float
+    frame_number: int
+    faces: List[FaceDetection]
+    processing_time: float    
+
+@dataclass
+class CachedFaceData:
+    """Cached face recognition and emotion data"""
+    human_guid: Optional[str] = None
+    human_name: Optional[str] = None
+    human_type: Optional[str] = None
+    recognition_confidence: float = 0.0
+    is_recognized: bool = False
+    emotion: str = "neutral"
+    emotion_confidence: float = 0.5
+    last_update: float = 0.0
+    update_count: int = 0
+    pose_info: Optional[dict] = None  

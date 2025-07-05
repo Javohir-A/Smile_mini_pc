@@ -10,9 +10,10 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from uuid import UUID, uuid4
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 import queue
+
 
 from src.processors.face_detection_processor import DetectionResult, FaceDetection
 from src.models.video_storage import VideoRecord
@@ -32,16 +33,21 @@ class PersonVideoSession:
     frames: deque
     camera_id: str
     last_seen: datetime
+    
+    frame_times: deque = field(default_factory=lambda: deque(maxlen=100))  # Track frame timing
+
 
 class AsyncVideoStorageProcessor:
     """Async video processor that doesn't block real-time streaming"""
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.min_video_duration = 0.5  # Minimum 0.5 seconds
+        # self.min_video_duration = 0.5  # Minimum 0.5 seconds
         self.max_video_duration = 600.0  # Maximum 10 minutes
         self.timeout_seconds = 5.0  # Person disappeared timeout
-        
+
+        self.frame_timestamps = {}  # Track timestamps per session for FPS calculation
+
         # Active video sessions per person per emotion
         self.active_sessions: Dict[UUID, PersonVideoSession] = {}
         self.upload_callbacks: List[callable] = []
@@ -224,9 +230,32 @@ class AsyncVideoStorageProcessor:
             
     def add_upload_callback(self, callback: callable):
         """Add callback for when videos are ready to upload"""
+        
+        # def cleanup_callback(video_record):
+        #     """Wrapper to add cleanup after upload"""
+        #     try:
+        #         # Call the original callback
+        #         result = callback(video_record)
+                
+        #         # Clean up the video file immediately after upload
+        #         if os.path.exists(video_record.file_path):
+        #             os.remove(video_record.file_path)
+        #             logger.info(f"🧹 Cleaned up video file after upload: {video_record.file_path}")
+                    
+        #         return result
+        #     except Exception as e:
+        #         logger.error(f"Error in upload callback with cleanup: {e}")
+        #         # Still try to clean up even if callback failed
+        #         try:
+        #             if os.path.exists(video_record.file_path):
+        #                 os.remove(video_record.file_path)
+        #                 logger.info(f"🧹 Cleaned up video file after failed upload: {video_record.file_path}")
+        #         except:
+        #             pass
+        
         self.upload_callbacks.append(callback)
-        logger.info(f"Added video upload callback: {callback.__name__}")
-    
+        logger.info(f"Added video upload callback with cleanup: {callback.__name__}")
+        
     def process_detection(self, detection_result: DetectionResult, frame: any):
         """Process detection and manage video sessions - NON-BLOCKING"""
         current_time = datetime.now()
@@ -253,6 +282,9 @@ class AsyncVideoStorageProcessor:
                 
                 if human_id in self.active_sessions:
                     session = self.active_sessions[human_id]
+                    
+                    # Track frame timing for FPS calculation
+                    session.frame_times.append(current_time)
                     
                     # Check if emotion changed
                     if session.emotion != emotion:
@@ -294,27 +326,30 @@ class AsyncVideoStorageProcessor:
                 
                 # Add frame to current session (quick operation)
                 if human_id in self.active_sessions:
-                    self.active_sessions[human_id].frames.append({
+                    session = self.active_sessions[human_id]
+                    session.frames.append({
                         'frame': annotated_frame,
                         'timestamp': current_time
                     })
-            
+                    # Track frame timing for FPS calculation
+                    session.frame_times.append(current_time)
+
             # Check for people who disappeared
             self._check_session_timeouts(current_time, detection_result.stream_id, current_people)
-    
+            
     def _queue_session_for_processing(self, session: PersonVideoSession, end_time: datetime):
         """Queue session for background processing - NON-BLOCKING"""
         duration = (end_time - session.start_time).total_seconds()
         
         logger.debug(f"🎬 Attempting to queue session: {session.human_name} - {session.emotion}")
         logger.debug(f"   Duration: {duration:.1f}s, Frames: {len(session.frames)}")
-        logger.debug(f"   Min duration: {self.min_video_duration}s")
+        # logger.debug(f"   Min duration: {self.min_video_duration}s")
         logger.debug(f"   Workers started: {self.processing_workers_started}")
         logger.debug(f"   Queue size: {self.video_processing_queue.qsize()}")
         
-        if duration < self.min_video_duration:
-            logger.debug(f"⏭️ Skipping short video for {session.human_name}: {duration:.1f}s")
-            return
+        # if duration < self.min_video_duration:
+        #     logger.debug(f"⏭️ Skipping short video for {session.human_name}: {duration:.1f}s")
+        #     return
         
         if len(session.frames) < 1:
             logger.debug(f"⏭️ Not enough frames for {session.human_name}: {len(session.frames)}")
@@ -356,7 +391,8 @@ class AsyncVideoStorageProcessor:
             start_time=start_time,
             frames=deque(maxlen=900),  # 30 seconds at 30fps
             camera_id=camera_id,
-            last_seen=start_time
+            last_seen=start_time,
+            frame_times=deque(maxlen=100)  # Track frame timing for FPS
         )
         
         self.active_sessions[human_id] = session
@@ -392,8 +428,8 @@ class AsyncVideoStorageProcessor:
     def _create_video_with_ffmpeg_async(self, session: PersonVideoSession, end_time: datetime, filename: str) -> Optional[VideoRecord]:
         """Enhanced FFmpeg video creation with permission handling"""
         
-        final_file = os.path.join(self.video_dir, filename)
-        
+        final_file = os.path.join(self.temp_dir, filename)  # Use temp_dir instead of video_dir
+
         # Get frame dimensions
         if not session.frames:
             logger.error("No frames available for video creation")
@@ -411,8 +447,9 @@ class AsyncVideoStorageProcessor:
             return None
             
         height, width = first_frame.shape[:2]
-        fps = 15.0
-        
+        fps = self._calculate_actual_fps(session)
+        logger.info(f"Using calculated FPS: {fps:.1f} for {session.human_name}")
+
         # Create temp directory with fallback options
         temp_frames_dir = None
         temp_dir_attempts = [
@@ -537,8 +574,8 @@ class AsyncVideoStorageProcessor:
     def _create_video_with_opencv_async(self, session: PersonVideoSession, end_time: datetime, filename: str) -> Optional[VideoRecord]:
         """Improved OpenCV video creation with better codec handling"""
         
-        file_path = os.path.join(self.video_dir, filename)
-        
+        file_path = os.path.join(self.temp_dir, filename)  # Use temp_dir instead of video_dir
+
         # Get frame dimensions
         first_frame = session.frames[0]['frame']
         height, width = first_frame.shape[:2]
@@ -556,7 +593,9 @@ class AsyncVideoStorageProcessor:
             ('MJPG', cv2.VideoWriter_fourcc(*'MJPG')),  # Motion JPEG
         ]
         
-        fps = 15.0  # Reduced FPS for better compatibility
+        fps = self._calculate_actual_fps(session)
+        logger.info(f"Using calculated FPS: {fps:.1f} for {session.human_name}")
+        
         out = None
         successful_codec = None
         
@@ -727,6 +766,34 @@ class AsyncVideoStorageProcessor:
                 'processing_queue_size': self.video_processing_queue.qsize(),
                 'background_workers': 'Running' if self.processing_workers_started else 'Stopped'
             }
-
+                
+    def _calculate_actual_fps(self, session: PersonVideoSession) -> float:
+        """Calculate proper FPS for real-time video playback"""
+        
+        if len(session.frames) < 2:
+            logger.warning(f"Not enough frames to calculate FPS, using default 25 FPS")
+            return 25.0
+        
+        # Get total duration of the session
+        total_duration = (session.frames[-1]['timestamp'] - session.frames[0]['timestamp']).total_seconds()
+        
+        if total_duration <= 0:
+            logger.warning(f"Invalid duration {total_duration}, using default 25 FPS")
+            return 25.0
+        
+        # Calculate FPS as: total_frames / total_duration
+        calculated_fps = len(session.frames) / total_duration
+        
+        # Clamp to reasonable range for video playback
+        # Most cameras capture at 15-30 FPS, don't go below 15 or above 60
+        calculated_fps = max(15.0, min(60.0, calculated_fps))
+        
+        logger.info(f"📊 FPS Calculation for {session.human_name}:")
+        logger.info(f"   Frames: {len(session.frames)}")
+        logger.info(f"   Duration: {total_duration:.2f}s")
+        logger.info(f"   Calculated FPS: {calculated_fps:.1f}")
+        
+        return calculated_fps
 # Backward compatibility alias
 VideoStorageProcessor = AsyncVideoStorageProcessor
+
