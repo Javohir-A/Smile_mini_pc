@@ -703,9 +703,9 @@ class AsyncVideoStorageProcessor:
             session = self.active_sessions[human_id]
             self._queue_session_for_processing(session, current_time)
             del self.active_sessions[human_id]
-            
+                
     def cleanup(self):
-        """Cleanup and finish all active sessions"""
+        """NON-BLOCKING cleanup with proper async handling"""
         with self.lock:
             current_time = datetime.now()
             logger.info(f"🧹 Cleaning up {len(self.active_sessions)} active video sessions...")
@@ -716,31 +716,20 @@ class AsyncVideoStorageProcessor:
             
             self.active_sessions.clear()
         
-        # Wait for background processing to complete (with timeout)
-        logger.info("⏳ Waiting for background video processing to complete...")
+        # NON-BLOCKING: Don't wait for queue processing
+        logger.info("⚡ Starting non-blocking cleanup...")
         try:
-            # Wait for queue to be processed
-            start_time = time.time()
-            while not self.video_processing_queue.empty() and (time.time() - start_time) < 30:
-                time.sleep(0.5)
+            # Give short grace period only
+            if not self.video_processing_queue.empty():
+                logger.info(f"📋 {self.video_processing_queue.qsize()} videos queued for background processing")
             
-            # Shutdown executor
-            self.video_executor.shutdown(wait=True, timeout=10)
+            # NON-BLOCKING shutdown
+            self.video_executor.shutdown(wait=False)  # CHANGED: wait=False
             
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
         
-        # Clean up temporary directory
-        try:
-            for temp_file in os.listdir(self.temp_dir):
-                temp_path = os.path.join(self.temp_dir, temp_file)
-                if os.path.isfile(temp_path):
-                    os.remove(temp_path)
-                    logger.debug(f"Removed temp file: {temp_file}")
-        except Exception as e:
-            logger.warning(f"Error cleaning temp directory: {e}")
-        
-        logger.info("Async video storage processor cleaned up")
+        logger.info("⚡ Non-blocking cleanup completed")
     
     def get_stats(self) -> dict:
         """Get processor statistics"""

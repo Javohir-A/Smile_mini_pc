@@ -14,7 +14,7 @@ from src.config import AppConfig
 from src.di.dependencies import initialize_dependencies, DependencyContainer
 from .monitoring import ResourceMonitor
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
 class StreamApplication:

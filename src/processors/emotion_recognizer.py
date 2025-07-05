@@ -83,6 +83,15 @@ class DeepFaceEmotionRecognizer:
         
         current_time = time.time()
         
+        # FIXED: Check emotion history BEFORE cache to maintain continuity
+        if face_id in self.emotion_histories:
+            history = self.emotion_histories[face_id]
+
+            # If we have recent emotion data, don't fall back to neutral immediately
+            if (current_time - history.last_update) < 2.0:  # 2 second grace period
+                logger.debug(f"Using recent emotion for {face_id}: {history.current_emotion}")
+                return history.current_emotion, 0.6, {history.current_emotion: 60.0}
+        
         # Check cache
         if face_id in self.emotion_cache:
             cached_data, cache_time = self.emotion_cache[face_id]

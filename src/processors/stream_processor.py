@@ -1,9 +1,11 @@
-# src/processors/stream_processor.py - FIXED VERSION
 import cv2
 import threading
 import queue
 import time
 import logging
+import subprocess
+import signal
+import os
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -13,8 +15,6 @@ from src.config import AppConfig
 from src.api.fastapi_server import FastAPIWebSocketServer   
 from src.models.stream import FrameData
 
-# logging.getLogger("src.api.fastapi_server").setLevel(logging.DEBUG)
-# logging.getLogger("src.processors.stream_processor").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 class StreamStatus(Enum):
@@ -47,17 +47,22 @@ class DisplayFrame:
     timestamp: float
 
 class StreamReader:
-    """Individual stream reader - CAPTURE ONLY, NO GUI"""
+    """FFmpeg-based stream reader - ROBUST RTSP HANDLING"""
     
     def __init__(self, stream_id: str, url: str, config: AppConfig):
         self.stream_id = stream_id
         self.url = url
         self.config = config
-        self.cap = None
+        
+        # FFmpeg process instead of OpenCV VideoCapture
+        self.ffmpeg_process = None
+        self.use_ffmpeg = True  # Toggle to fallback to OpenCV if needed
+        self.cap = None  # Fallback OpenCV capture
+        
         self.running = False
         self.thread = None
         
-        # Frame communication - no GUI operations here
+        # Frame communication
         self.frame_queue = queue.Queue(maxsize=2)
         self.info = StreamInfo(
             stream_id=stream_id,
@@ -75,53 +80,141 @@ class StreamReader:
         self._fps_window = []
         self._fps_window_size = 10
         self._color_format_warned = False
-        self._force_color_conversion = True
         self.face_detector = None
+        
+        # FFmpeg specific settings
+        self.frame_width = 1280
+        self.frame_height = 720
+        self.frame_size = self.frame_width * self.frame_height * 3  # BGR24
+        self.target_fps = 25
+        
+        logger.info(f"StreamReader {stream_id} initialized with FFmpeg backend")
         
     def set_face_detector(self, face_detector):
         """Set the face detection processor"""
         self.face_detector = face_detector
     
+    def _create_ffmpeg_command(self) -> List[str]:
+        """Create FFmpeg command for robust RTSP streaming"""
+        cmd = [
+            'ffmpeg',
+            '-i', self.url,
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-r', str(self.target_fps),
+            '-s', f'{self.frame_width}x{self.frame_height}',
+            '-loglevel', 'error',  # Only show errors
+            '-fflags', '+genpts',  # Generate presentation timestamps
+            '-avoid_negative_ts', 'make_zero',
+            '-'  # Output to stdout
+        ]
+        return cmd
+    
+    def _start_ffmpeg_process(self) -> bool:
+        """Start FFmpeg subprocess"""
+        try:
+            if self.ffmpeg_process:
+                self._stop_ffmpeg_process()
+            
+            cmd = self._create_ffmpeg_command()
+            logger.info(f"Starting FFmpeg for {self.stream_id}: {' '.join(cmd[:3])}...")
+            
+            # Start FFmpeg process
+            self.ffmpeg_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=self.frame_size,
+                preexec_fn=os.setsid  # Create new process group for clean shutdown
+            )
+            
+            # Test read one frame to verify connection
+            test_data = self.ffmpeg_process.stdout.read(self.frame_size)
+            if len(test_data) == self.frame_size:
+                logger.info(f"FFmpeg process started successfully for {self.stream_id}")
+                return True
+            else:
+                logger.error(f"FFmpeg test frame failed for {self.stream_id}: got {len(test_data)} bytes, expected {self.frame_size}")
+                self._stop_ffmpeg_process()
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to start FFmpeg process for {self.stream_id}: {e}")
+            self._stop_ffmpeg_process()
+            return False
+    
+    def _stop_ffmpeg_process(self):
+        """Stop FFmpeg subprocess cleanly"""
+        if self.ffmpeg_process:
+            try:
+                # Send SIGTERM to process group
+                os.killpg(os.getpgid(self.ffmpeg_process.pid), signal.SIGTERM)
+                
+                # Wait for graceful shutdown
+                try:
+                    self.ffmpeg_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Force kill if needed
+                    os.killpg(os.getpgid(self.ffmpeg_process.pid), signal.SIGKILL)
+                    self.ffmpeg_process.wait()
+                    
+            except Exception as e:
+                logger.debug(f"Error stopping FFmpeg process: {e}")
+            finally:
+                self.ffmpeg_process = None
+    
     def _read_frames(self):
-        """Frame reading loop - NO GUI OPERATIONS"""
+        """Frame reading loop using FFmpeg subprocess"""
         consecutive_failures = 0
         last_frame_time = time.time()
+        max_failures = 20  # More tolerant than OpenCV
 
         while self.running:
             try:
-                if not self.cap or not self.cap.isOpened():
-                    if not self._reconnect():
-                        time.sleep(self.config.camera.reconnect_delay)
-                        continue
-                
-                frame_start = time.time()
-                ret, frame = self.cap.read()
-                
-                if not ret or frame is None:
+                # Ensure FFmpeg process is running
+                if not self._ensure_connection():
                     consecutive_failures += 1
-                    logger.warning(f"Failed to read frame from stream {self.stream_id} (attempt {consecutive_failures})")
-                    
-                    if consecutive_failures >= self.config.camera.max_errors:
-                        logger.error(f"Max consecutive failures reached for stream {self.stream_id}")
+                    if consecutive_failures >= max_failures:
                         if not self._reconnect():
-                            break
+                            time.sleep(1.0)
+                            continue
                         consecutive_failures = 0
                     continue
                 
-                # Handle color format conversion
-                if self._force_color_conversion:
-                    try:
-                        frame = self._convert_frame_color(frame)
-                    except Exception as e:
-                        if not self._color_format_warned:
-                            logger.warning(f"Frame color conversion failed for stream {self.stream_id}: {e}")
-                            self._color_format_warned = True
+                frame_start = time.time()
                 
+                # Read frame from FFmpeg
+                if self.use_ffmpeg and self.ffmpeg_process:
+                    ret, frame = self._read_ffmpeg_frame()
+                else:
+                    # Fallback to OpenCV
+                    ret, frame = self._read_opencv_frame()
+                
+                if not ret or frame is None:
+                    consecutive_failures += 1
+                    
+                    # Only log occasionally to avoid spam
+                    if consecutive_failures <= 5 or consecutive_failures % 10 == 0:
+                        logger.warning(f"Failed to read frame from stream {self.stream_id} "
+                                     f"(attempt {consecutive_failures})")
+                    
+                    if consecutive_failures >= max_failures:
+                        logger.error(f"Too many consecutive failures for stream {self.stream_id}")
+                        if not self._reconnect():
+                            time.sleep(1.0)
+                        consecutive_failures = 0
+                    continue
+                
+                # SUCCESS: Reset counters
                 consecutive_failures = 0
-                current_time = time.time()
+                if self.info.reconnect_count > 0:
+                    logger.info(f"Stream {self.stream_id} recovered after {self.info.reconnect_count} attempts")
+                    self.info.reconnect_count = 0
                 
-                # Calculate FPS
+                # Update timing and stats
+                current_time = time.time()
                 frame_interval = current_time - last_frame_time
+                
                 if frame_interval > 0:
                     instant_fps = 1.0 / frame_interval
                     self._fps_window.append(instant_fps)
@@ -136,7 +229,7 @@ class StreamReader:
                 
                 last_frame_time = current_time
                 
-                # Create frame data - NO GUI OPERATIONS HERE
+                # Create frame data
                 frame_data = FrameData(
                     stream_id=self.stream_id,
                     frame=frame,
@@ -145,7 +238,7 @@ class StreamReader:
                     stream_info=self.info
                 )
                 
-                # Add to queue - drop old frames for real-time processing
+                # Add to queue (drop old frames)
                 try:
                     while not self.frame_queue.empty():
                         try:
@@ -158,141 +251,149 @@ class StreamReader:
                 except queue.Full:
                     pass
                 
-                # Minimal processing delay
+                # Minimal delay
                 processing_time = time.time() - frame_start
-                if processing_time < 0.001:
-                    time.sleep(0.001)
+                if processing_time < 0.01:  # 10ms max frame rate
+                    time.sleep(0.01)
                 
             except Exception as e:
-                logger.error(f"Error in stream reader {self.stream_id}: {e}")
+                logger.error(f"Error in frame reading for {self.stream_id}: {e}")
                 consecutive_failures += 1
-                if consecutive_failures >= self.config.camera.max_errors:
-                    break
-                time.sleep(self.config.camera.reconnect_delay)
+                if consecutive_failures >= max_failures:
+                    if not self._reconnect():
+                        time.sleep(1.0)
+                    consecutive_failures = 0
+        
+        # Cleanup
+        self._stop_ffmpeg_process()
+        if self.cap:
+            self.cap.release()
+            self.cap = None
         
         logger.info(f"Stream reader {self.stream_id} thread ended")
     
+    def _read_ffmpeg_frame(self) -> tuple[bool, Optional[np.ndarray]]:
+        """Read frame from FFmpeg subprocess"""
+        try:
+            if not self.ffmpeg_process or self.ffmpeg_process.poll() is not None:
+                return False, None
+            
+            # Read raw frame data
+            frame_data = self.ffmpeg_process.stdout.read(self.frame_size)
+            
+            if len(frame_data) != self.frame_size:
+                if len(frame_data) == 0:
+                    # EOF - process ended
+                    return False, None
+                else:
+                    # Partial frame - skip it
+                    logger.debug(f"Partial frame received: {len(frame_data)}/{self.frame_size} bytes")
+                    return False, None
+            
+            # Convert raw bytes to numpy array
+            frame = np.frombuffer(frame_data, dtype=np.uint8)
+            frame = frame.reshape((self.frame_height, self.frame_width, 3))
+            
+            return True, frame
+            
+        except Exception as e:
+            logger.debug(f"FFmpeg frame read error: {e}")
+            return False, None
+    
+    def _read_opencv_frame(self) -> tuple[bool, Optional[np.ndarray]]:
+        """Fallback: Read frame using OpenCV"""
+        try:
+            if not self.cap or not self.cap.isOpened():
+                return False, None
+            
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                # Resize to expected dimensions
+                if frame.shape[:2] != (self.frame_height, self.frame_width):
+                    frame = cv2.resize(frame, (self.frame_width, self.frame_height))
+            
+            return ret, frame
+            
+        except Exception as e:
+            logger.debug(f"OpenCV frame read error: {e}")
+            return False, None
+    
+    def _ensure_connection(self) -> bool:
+        """Ensure connection is active"""
+        if self.use_ffmpeg:
+            return (self.ffmpeg_process is not None and 
+                   self.ffmpeg_process.poll() is None)
+        else:
+            return self.cap is not None and self.cap.isOpened()
+    
     def connect(self) -> bool:
-        """Connect to the stream with optimized settings"""
+        """Connect to the stream"""
         try:
             self.info.status = StreamStatus.CONNECTING
             logger.info(f"Connecting to stream {self.stream_id}: {self.url}")
             
-            if not self.url or self.url == "0" or self.url == "":
-                logger.warning(f"Invalid URL for stream {self.stream_id}: {self.url}")
+            if not self.url or self.url in ["0", ""]:
                 raise Exception("Invalid stream URL")
             
-            # Try different backends
-            backends_to_try = [
-                (cv2.CAP_FFMPEG, {}),
-                (cv2.CAP_GSTREAMER, {}),
-                (cv2.CAP_ANY, {})
-            ]
+            # Try FFmpeg first
+            if self.use_ffmpeg:
+                if self._start_ffmpeg_process():
+                    self.info.resolution = (self.frame_width, self.frame_height)
+                    self.info.status = StreamStatus.ACTIVE
+                    logger.info(f"Stream {self.stream_id} connected via FFmpeg. Resolution: {self.frame_width}x{self.frame_height}")
+                    return True
+                else:
+                    logger.warning(f"FFmpeg failed for {self.stream_id}, trying OpenCV fallback")
+                    self.use_ffmpeg = False
             
-            self.cap = None
-            for backend, options in backends_to_try:
-                try:
-                    self.cap = cv2.VideoCapture(self.url, backend)
-                    if self.cap.isOpened():
-                        logger.info(f"Successfully opened stream {self.stream_id} with backend {backend}")
-                        break
-                    else:
-                        if self.cap:
-                            self.cap.release()
-                        self.cap = None
-                except Exception as e:
-                    logger.debug(f"Backend {backend} failed for stream {self.stream_id}: {e}")
-                    if self.cap:
-                        self.cap.release()
-                    self.cap = None
-                    continue
-            
-            if not self.cap:
-                self.cap = cv2.VideoCapture(self.url)
-            
-            if not self.cap.isOpened():
-                raise Exception("Failed to open video capture with any backend")
-            
-            # Optimize capture properties
-            self._optimize_capture_properties()
-            
-            # Test read a frame
-            ret, test_frame = self.cap.read()
-            if not ret:
-                raise Exception("Failed to read test frame from stream")
-            
-            if test_frame is not None:
-                logger.info(f"Stream {self.stream_id} frame shape: {test_frame.shape}, dtype: {test_frame.dtype}")
-            
-            # Get stream properties
-            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-            
-            self.info.resolution = (width, height)
-            self.info.status = StreamStatus.ACTIVE
-            logger.info(f"Stream {self.stream_id} connected successfully. Resolution: {width}x{height}, FPS: {actual_fps}")
-            return True
+            # Fallback to OpenCV
+            if not self.use_ffmpeg:
+                return self._connect_opencv()
+                
+            return False
             
         except Exception as e:
             logger.error(f"Failed to connect to stream {self.stream_id}: {e}")
             self.info.status = StreamStatus.ERROR
             self.info.error_count += 1
             return False
-        
-    def _optimize_capture_properties(self):
-        """Apply capture optimizations safely"""
+    
+    def _connect_opencv(self) -> bool:
+        """Fallback OpenCV connection"""
         try:
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except:
-            pass
-        
-        try:
-            if self.url.startswith(('rtsp://', 'rtmp://')):
-                self.cap.set(cv2.CAP_PROP_FPS, 30)
-            else:
-                self.cap.set(cv2.CAP_PROP_FPS, 25)
-        except:
-            pass
-        
-        try:
-            self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-            logger.debug(f"Enabled RGB conversion for stream {self.stream_id}")
-        except:
-            pass
-        
-        # Network stream optimizations
-        if self.url.startswith(('rtsp://', 'rtmp://', 'http://')):
-            timeout_props = [
-                (cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000),
-                (cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000)
-            ]
+            backends_to_try = [cv2.CAP_FFMPEG, cv2.CAP_GSTREAMER, cv2.CAP_ANY]
             
-            for prop, value in timeout_props:
+            for backend in backends_to_try:
                 try:
-                    self.cap.set(prop, value)
-                except:
-                    pass
-        
-    def _convert_frame_color(self, frame):
-        """Convert frame to proper color format if needed"""
-        try:
-            if len(frame.shape) == 3 and frame.shape[2] == 3:
-                b, g, r = cv2.split(frame)
-                if np.array_equal(b, g) and np.array_equal(g, r):
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                return frame
-            elif len(frame.shape) == 2:
-                return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            else:
-                return frame
+                    self.cap = cv2.VideoCapture(self.url, backend)
+                    if self.cap.isOpened():
+                        # Test frame read
+                        ret, test_frame = self.cap.read()
+                        if ret and test_frame is not None:
+                            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                            
+                            self.info.resolution = (width, height)
+                            self.info.status = StreamStatus.ACTIVE
+                            logger.info(f"Stream {self.stream_id} connected via OpenCV backend {backend}")
+                            return True
+                    
+                    if self.cap:
+                        self.cap.release()
+                        self.cap = None
+                        
+                except Exception as e:
+                    logger.debug(f"OpenCV backend {backend} failed: {e}")
+                    if self.cap:
+                        self.cap.release()
+                        self.cap = None
+            
+            return False
+            
         except Exception as e:
-            if not self._color_format_warned:
-                logger.warning(f"Color conversion error for stream {self.stream_id}: {e}")
-                self._color_format_warned = True
-            return frame
-        
+            logger.error(f"OpenCV fallback failed: {e}")
+            return False
+    
     def start(self):
         """Start reading frames"""
         if self.running:
@@ -311,6 +412,8 @@ class StreamReader:
         self.running = False
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=5)
+        
+        self._stop_ffmpeg_process()
         
         if self.cap:
             self.cap.release()
@@ -334,23 +437,32 @@ class StreamReader:
 
     def _reconnect(self) -> bool:
         """Attempt to reconnect to the stream"""
-        if self.info.reconnect_count >= self.config.camera.max_reconnects:
-            logger.error(f"Max reconnection attempts reached for stream {self.stream_id}")
-            self.info.status = StreamStatus.ERROR
-            return False
-        
         self.info.status = StreamStatus.RECONNECTING
         self.info.reconnect_count += 1
         
         logger.info(f"Attempting to reconnect stream {self.stream_id} (attempt {self.info.reconnect_count})")
         
+        # Clean up current connection
+        self._stop_ffmpeg_process()
         if self.cap:
             self.cap.release()
             self.cap = None
         
-        time.sleep(min(self.config.camera.reconnect_delay, 2.0))
+        # Progressive backoff
+        if self.info.reconnect_count <= 5:
+            delay = 1.0
+        elif self.info.reconnect_count <= 10:
+            delay = 3.0
+        else:
+            delay = 5.0
+        
+        logger.info(f"Waiting {delay}s before reconnection attempt...")
+        time.sleep(delay)
+        
+        # Reset to try FFmpeg first again
+        self.use_ffmpeg = True
+        
         return self.connect()
-
 
 class CentralizedDisplayManager:
     """Manages all camera displays in a single thread - THREAD SAFE"""

@@ -49,11 +49,11 @@ class FaceDetectionProcessor:
         
         # ULTRA OPTIMIZATION: Aggressive caching and processing intervals
         self.face_cache: Dict[str, CachedFaceData] = {}  # Cache all face data
-        self.cache_timeout = 0.5  # Keep cache for 3 seconds
+        self.cache_timeout = 5.0  # Keep cache for 3 seconds
         
         # Recognition cache
         self.recognition_cache = {}
-        self.recognition_cache_timeout = 0.2  # Cache for 0.2 seconds
+        self.recognition_cache_timeout = 3.0  # Cache for 0.2 seconds
         
         # Processing intervals to reduce load
         self.emotion_process_every = 3  # Process emotion every 3 frames
@@ -373,33 +373,45 @@ class FaceDetectionProcessor:
 
 
     def _get_cached_face_data(self, face_id: str) -> CachedFaceData:
-        """Get cached face data or create new cache entry"""
+        """Get cached face data with better timeout handling"""
         current_time = time.time()
         
         if face_id in self.face_cache:
             cached_data = self.face_cache[face_id]
-            # Check if cache is still valid
-            if current_time - cached_data.last_update < self.cache_timeout:
-                # Ensure pose_info exists (for backward compatibility)
+            
+            # FIXED: Different timeouts for different data types
+            recognition_timeout = 8.0  # Keep recognition longer
+            emotion_timeout = 2.0      # Emotion can be more dynamic
+            
+            recognition_valid = (current_time - cached_data.last_update) < recognition_timeout
+            
+            if recognition_valid:
+                # Ensure pose_info exists
                 if not hasattr(cached_data, 'pose_info') or cached_data.pose_info is None:
                     cached_data.pose_info = self._get_default_pose_info()
                 return cached_data
+            
+            # FIXED: If recognition data expired but emotion is still valid, preserve recognition
+            elif cached_data.is_recognized and (current_time - cached_data.last_update) < (recognition_timeout + 3.0):
+                logger.debug(f"Preserving recognition for {face_id} during cache refresh")
+                # Keep recognition data, but allow emotion to update
+                return cached_data
         
-        # Create new cache entry with pose_info
+        # Create new cache entry
         new_cache_data = CachedFaceData(
             last_update=current_time,
             pose_info=self._get_default_pose_info()
         )
         self.face_cache[face_id] = new_cache_data
-        return new_cache_data       
-
-# PRECISE THRESHOLD FIX: Stop false positive matches
+        return new_cache_data
 
     def _update_face_cache_async(self, face_id: str, face_roi_expanded: np.ndarray, 
                         face_roi: np.ndarray, should_process_pose: bool = False):
-        """UPDATED: Better validation logic"""
+        """Clean and simple face cache update"""
+        
         def background_update():
             try:
+                # Prevent duplicate processing
                 with self.recognition_lock:
                     if face_id in self.recognition_in_progress:
                         return
@@ -410,97 +422,144 @@ class FaceDetectionProcessor:
                 if not cached_data:
                     return
 
+                # Store original recognition state
+                original_recognized = cached_data.is_recognized
+                original_name = cached_data.human_name
+                original_guid = cached_data.human_guid
+                original_confidence = cached_data.recognition_confidence
+
+                # Ensure pose info exists
                 if not hasattr(cached_data, 'pose_info') or cached_data.pose_info is None:
                     cached_data.pose_info = self._get_default_pose_info()
 
-                # Recognition processing
-                if (self.face_recognizer and self.face_recognizer.available and self.face_usecase):
-                    should_check_recognition = (
-                        not cached_data.is_recognized or
-                        (current_time - cached_data.last_update) > 8.0
-                    )
-                    
-                    if should_check_recognition:
-                        logger.debug(f"Checking database for face {face_id}")
-                        
-                        face_embedding = self.face_recognizer.extract_face_embedding(face_roi_expanded, face_id)
-                        
-                        if face_embedding:
-                            search_results = self.face_usecase.search_similar_faces(
-                                face_embedding, limit=5, threshold=2.0  # SLIGHTLY INCREASED from 1.8
-                            )
-                            
-                            if search_results and len(search_results) > 0:
-                                # Log all matches
-                                logger.info(f"🔍 Recognition analysis for {face_id}:")
-                                for i, match in enumerate(search_results[:3]):
-                                    confidence = self._calculate_recognition_confidence(match.distance)
-                                    logger.info(f"  {i+1}. {match.name} - L2: {match.distance:.3f}, conf: {confidence:.3f}")
-                                
-                                best_match = search_results[0]
-                                
-                                # USE SIMPLER VALIDATION
-                                is_valid_match = self._validate_face_match(best_match, search_results, face_id)                                
-                                
-                                if is_valid_match:
-                                    with self.recognition_lock:
-                                        cached_data.human_guid = best_match.human_guid
-                                        cached_data.human_name = best_match.name
-                                        cached_data.human_type = best_match.human_type
-                                        cached_data.recognition_confidence = self._calculate_recognition_confidence(best_match.distance)
-                                        cached_data.is_recognized = True
-                                    
-                                    logger.info(f"✅ RECOGNIZED: Face {face_id} as '{best_match.name}' "
-                                            f"(L2: {best_match.distance:.3f}, conf: {cached_data.recognition_confidence:.1%})")
-                                    
-                                    with self.unknown_processing_lock:
-                                        if face_id in self.unknown_person_manager.unknown_faces_buffer:
-                                            self.unknown_person_manager.cleanup_face(face_id)
-                                        self.unknown_person_manager.saved_faces.add(face_id)
-                                else:
-                                    logger.info(f"❌ REJECTED MATCH: Face {face_id} -> '{best_match.name}' "
-                                            f"(L2: {best_match.distance:.3f}) - failed validation")
-                                    
-                                    # ADD DEBUGGING FOR FAILURES
-                                    self._debug_validation_failure(best_match, search_results, face_id)
-                            else:
-                                logger.info(f"🔍 NO MATCHES: Face {face_id} - processing as unknown")
-
-                # Emotion processing (unchanged)
-                if self.emotion_recognizer and self.emotion_recognizer.available:
-                    should_update_emotion = True
-                    
-                    if should_update_emotion:
-                        try:
-                            emotion_result = self.emotion_recognizer.predict_emotion(face_roi, None)
-                            
-                            if emotion_result and len(emotion_result) >= 2:
-                                emotion, emotion_conf = emotion_result[0], emotion_result[1]
-                                
-                                if emotion and emotion_conf > 0.1:
-                                    old_emotion = cached_data.emotion
-                                    cached_data.emotion = emotion
-                                    cached_data.emotion_confidence = emotion_conf
-                                    
-                                    if old_emotion != emotion:
-                                        logger.info(f"🎭 EMOTION CHANGED for {face_id}: {old_emotion} -> {emotion} ({emotion_conf:.2f})")
-                            
-                        except Exception as e:
-                            logger.error(f"🎭 Emotion processing error for {face_id}: {e}")
-
+                # === RECOGNITION PROCESSING ===
+                self._process_recognition(cached_data, face_roi_expanded, face_id, current_time)
+                
+                # === PREVENT RECOGNITION LOSS ===
+                if not cached_data.is_recognized and original_recognized:
+                    logger.warning(f"Recognition lost for {face_id}, restoring previous state")
+                    cached_data.is_recognized = original_recognized
+                    cached_data.human_name = original_name
+                    cached_data.human_guid = original_guid
+                    cached_data.recognition_confidence = max(0.7, original_confidence)
+                
+                # === EMOTION PROCESSING ===
+                self._process_emotion(cached_data, face_roi, face_id)
+                
+                # Update timestamp
                 cached_data.last_update = current_time
                 cached_data.update_count += 1
 
             except Exception as e:
                 logger.error(f"Background face update error for {face_id}: {e}")
             finally:
+                # Always cleanup
                 with self.recognition_lock:
                     self.recognition_in_progress.discard(face_id)
                 self.pending_background_tasks.discard(face_id)
 
+        # Submit background task
         if face_id not in self.pending_background_tasks:
             self.pending_background_tasks.add(face_id)
             self.background_executor.submit(background_update)
+
+
+    def _process_recognition(self, cached_data, face_roi_expanded, face_id, current_time):
+        """Handle recognition processing separately"""
+        if not (self.face_recognizer and self.face_recognizer.available and self.face_usecase):
+            return
+        
+        # Only check recognition if needed
+        should_check = (
+            not cached_data.is_recognized or
+            (current_time - cached_data.last_update) > 12.0
+        )
+        
+        if not should_check:
+            return
+        
+        logger.debug(f"Checking database for face {face_id}")
+        face_embedding = self.face_recognizer.extract_face_embedding(face_roi_expanded, face_id)
+        
+        if not face_embedding:
+            return
+        
+        search_results = self.face_usecase.search_similar_faces(
+            face_embedding, limit=5, threshold=2.0
+        )
+        
+        if not search_results:
+            logger.info(f"🔍 NO MATCHES: Face {face_id} - processing as unknown")
+            return
+        
+        # Log matches
+        logger.info(f"🔍 Recognition analysis for {face_id}:")
+        for i, match in enumerate(search_results[:3]):
+            confidence = self._calculate_recognition_confidence(match.distance)
+            logger.info(f"  {i+1}. {match.name} - L2: {match.distance:.3f}, conf: {confidence:.3f}")
+        
+        best_match = search_results[0]
+        is_valid_match = self._validate_face_match(best_match, search_results, face_id)
+        
+        if is_valid_match:
+            # Update recognition data
+            with self.recognition_lock:
+                cached_data.human_guid = best_match.human_guid
+                cached_data.human_name = best_match.name
+                cached_data.human_type = best_match.human_type
+                cached_data.recognition_confidence = self._calculate_recognition_confidence(best_match.distance)
+                cached_data.is_recognized = True
+            
+            logger.info(f"✅ RECOGNIZED: Face {face_id} as '{best_match.name}' "
+                    f"(L2: {best_match.distance:.3f}, conf: {cached_data.recognition_confidence:.1%})")
+            
+            # Cleanup unknown face processing
+            with self.unknown_processing_lock:
+                if face_id in self.unknown_person_manager.unknown_faces_buffer:
+                    self.unknown_person_manager.cleanup_face(face_id)
+                self.unknown_person_manager.saved_faces.add(face_id)
+        else:
+            logger.info(f"❌ REJECTED MATCH: Face {face_id} -> '{best_match.name}' "
+                    f"(L2: {best_match.distance:.3f}) - failed validation")
+            self._debug_validation_failure(best_match, search_results, face_id)
+
+
+    def _process_emotion(self, cached_data, face_roi, face_id):
+        """Handle emotion processing separately"""
+        if not (self.emotion_recognizer and self.emotion_recognizer.available):
+            return
+        
+        try:
+            emotion_result = self.emotion_recognizer.predict_emotion(face_roi, face_id)
+            
+            if not (emotion_result and len(emotion_result) >= 2):
+                return
+            
+            emotion, emotion_conf = emotion_result[0], emotion_result[1]
+            
+            if not (emotion and emotion_conf > 0.1):
+                return
+            
+            # CRITICAL: Prevent "neutral 0.5" fallback for recognized faces
+            if (cached_data.is_recognized and 
+                emotion == "neutral" and 
+                emotion_conf == 0.5 and 
+                cached_data.emotion and 
+                cached_data.emotion != "neutral"):
+                
+                logger.debug(f"Preserving emotion {cached_data.emotion} for recognized face {face_id}")
+                return  # Keep existing emotion
+            
+            # Update emotion
+            old_emotion = cached_data.emotion
+            cached_data.emotion = emotion
+            cached_data.emotion_confidence = emotion_conf
+            
+            if old_emotion != emotion:
+                logger.info(f"🎭 EMOTION CHANGED for {face_id}: {old_emotion} -> {emotion} ({emotion_conf:.2f})")
+        
+        except Exception as e:
+            logger.error(f"🎭 Emotion processing error for {face_id}: {e}")
 
 
     def _extract_face_regions(self, frame: np.ndarray, detection: np.ndarray, w: int, h: int) -> tuple:
@@ -539,7 +598,7 @@ class FaceDetectionProcessor:
         should_process_pose = (self.frame_counter % getattr(self, 'pose_process_every', 10) == 0)
         
         return should_process_recognition, should_process_emotion, should_process_pose
-
+    
     def _process_single_detection(self, frame: np.ndarray, detection: np.ndarray, 
                                 w: int, h: int, should_process_recognition: bool,
                                 should_process_emotion: bool, should_process_pose: bool) -> Optional[FaceDetection]:
@@ -564,23 +623,32 @@ class FaceDetectionProcessor:
         if (should_process_recognition or should_process_emotion or should_process_pose) and face_roi.size > 0:
             self._update_face_cache_async(face_id, face_roi_expanded, face_roi, 
                                         should_process_pose)
-        
+
         # Create face detection object
         face_detection = self._create_face_detection_object(x1, y1, width, height, confidence, face_id, cached_data)
         
         # IMPROVED: Process unknown faces more frequently (every 3 frames instead of every 10)
-        should_process_unknown = (self.frame_counter % 3 == 0)
+        should_process_unknown = (
+            self.frame_counter % 30 == 0 and  # Only every 30 frames (once per second)
+            face_id not in self.unknown_person_manager.processing_faces and
+            face_id not in self.unknown_person_manager.saved_faces
+        )
         
         logger.debug(f"🔍 DEBUG: face_id={face_id}, is_recognized={face_detection.is_recognized}, frame_counter={self.frame_counter}, should_process_unknown={should_process_unknown}")
         
         if not face_detection.is_recognized and should_process_unknown:
-            logger.info(f"🚀 SUBMITTING unknown face processing for {face_id}")  # ADD THIS
-            try:
-                self.background_executor.submit(
-                    self._process_unknown_face, face_roi, face_detection
-                )
-            except Exception as e:
-                logger.error(f"❌ Error submitting unknown face processing: {e}")  # ADD THIS
+            current_time = time.time()
+            last_seen = self.unknown_person_manager.face_first_seen.get(face_id, 0)
+            
+            # Only submit if we haven't recently processed this face
+            if current_time - last_seen > 10.0 or face_id not in self.unknown_person_manager.face_first_seen:
+                logger.info(f"🚀 SUBMITTING unknown face processing for {face_id}")
+                try:
+                    self.background_executor.submit(
+                        self._process_unknown_face, face_roi, face_detection
+                    )
+                except Exception as e:
+                    logger.error(f"❌ Error submitting unknown face processing: {e}")
         
         return face_detection
 
