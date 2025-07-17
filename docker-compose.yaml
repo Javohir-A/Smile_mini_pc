@@ -1,21 +1,20 @@
 version: '3.8'
-
 services:
   camera-app:
     image: javohirgo/smile-mini-pc-app:latest
     container_name: camera-streaming-app
     restart: unless-stopped
-
     privileged: false
     network_mode: host
-
     ports:
       - "8765:8765"
-
     volumes:
+      # Keep only these safe volume mounts
       - ./logs:/app/logs
       - ./data:/app/data
-
+      # REMOVE these lines that cause permission issues:
+      # - ./videos:/app/videos
+      # - ./temp_videos:/app/temp_videos
     environment:
       - PYTHONPATH=/app
       - HOST_MAC=${HOST_MAC}
@@ -24,7 +23,6 @@ services:
       - OPENCV_DNN_BACKEND=0
       - MPLBACKEND=Agg
       - LIBGL_ALWAYS_INDIRECT=1
-
       # Application-specific
       - ENABLE_WEBSOCKET=true
       - WEBSOCKET_PORT=8765
@@ -34,7 +32,6 @@ services:
       - VIDEO_TRIGGER_EMOTIONS=upset,smile,normal
       - FFMPEG_ENABLED=true
       - OPENCV_FFMPEG_CAPTURE_OPTIONS=protocol_whitelist;file,rtp,udp
-
     cap_drop:
       - ALL
     cap_add:
@@ -43,12 +40,11 @@ services:
       - FOWNER
       - SETGID
       - SETUID
-
     deploy:
       resources:
         limits:
-          memory: 2G
-          cpus: '2.0'
+          memory: 6G
+          cpus: '3.0'
         reservations:
-          memory: 512M
-          cpus: '0.5'
+          memory: 1G
+          cpus: '1.0'

@@ -266,7 +266,6 @@ class MilvusFaceRepository(FaceRepository):
                 logger.warning(f"Cannot delete: No face found with ID {record_id}")
                 return False
             
-            # Use proper expression format for large integers
             expr = f'id in [{record_id}]'  # Use 'in' instead of '=='
             logger.debug(f"Deleting with expression: {expr}")
             
@@ -550,77 +549,83 @@ class MilvusFaceRepository(FaceRepository):
         except Exception as e:
             logger.error(f"Error listing faces: {e}")
             return []
-        
+            
     def search_similar(self, face_embedding: List[float], limit: int = 10, 
                     threshold: float = 50) -> List[SearchResult]:
-        """Search for similar faces"""
+        """Enhanced search with better parameters"""
         
         if len(face_embedding) != self.embedding_dim:
             raise ValueError(f"Face embedding must have {self.embedding_dim} dimensions")
         
         search_params = {
             "metric_type": "L2",  
-            "params": {"nprobe": 10}
+            "params": {"nprobe": 16}  # Increased from 10 for better recall
         }
         
         try:
-            logger.debug(f"Searching for similar faces with threshold: {threshold}")
+            logger.debug(f"Searching with threshold: {threshold}, nprobe: 16")
+            
+            # Search with higher limit for better candidate selection
+            search_limit = min(limit * 2, 20)  # Get more candidates
             
             results = self._collection.search(
                 data=[face_embedding],
                 anns_field="face_embedding",
                 param=search_params,
-                limit=limit,
+                limit=search_limit,
                 output_fields=["id", "human_guid", "name", "human_type", "metadata"]
             )
 
             search_results = []
+            seen_persons = set()  # Avoid duplicate persons
+            
             for hits in results:
                 for hit in hits:
-                    if hit.score <= threshold:  # L2 distance threshold
+                    if hit.score <= threshold:
                         entity = hit.entity
                         
-                        # Improved entity data extraction
                         try:
-                            # Try direct attribute access first
-                            entity_id = str(getattr(entity, 'id', None))
                             entity_human_guid = getattr(entity, 'human_guid', None)
+                            
+                            # Skip if we already have a better match for this person
+                            if entity_human_guid in seen_persons:
+                                continue
+                                
+                            entity_id = str(getattr(entity, 'id', None))
                             entity_name = getattr(entity, 'name', None)
                             entity_human_type = getattr(entity, 'human_type', None)
-                            entity_metadata = getattr(entity, 'metadata', "{}")
                             
-                        except AttributeError:
-                            # Fallback to dictionary access
-                            try:
-                                entity_id = str(entity.get("id", None))
-                                entity_human_guid = entity.get("human_guid", None)
-                                entity_name = entity.get("name", None)
-                                entity_human_type = entity.get("human_type", None)
-                                entity_metadata = entity.get("metadata", "{}")
-                            except:
-                                logger.warning(f"Could not extract entity data from search result")
-                                continue
-                        
-                        # Calculate recognition confidence (1 - normalized distance)
-                        recognition_confidence = max(0.0, 1.0 - (hit.distance / 2.0))  # Normalize L2 distance
-                        
-                        search_results.append(SearchResult(
-                            id=entity_id,
-                            human_guid=entity_human_guid,
-                            name=entity_name,
-                            human_type=entity_human_type,
-                            similarity_score=hit.score,
-                            distance=hit.distance,
-                            recognition_confidence=recognition_confidence,
-                            metadata=self._deserialize_metadata(entity_metadata)
-                        ))
+                            if entity_name and entity_human_guid:
+                                confidence = self._calculate_confidence_from_distance(hit.score)
+                                
+                                search_results.append(SearchResult(
+                                    id=entity_id,
+                                    human_guid=entity_human_guid,
+                                    name=entity_name,
+                                    human_type=entity_human_type,
+                                    distance=hit.score,
+                                    recognition_confidence=confidence
+                                ))
+                                
+                                seen_persons.add(entity_human_guid)
+                                
+                                # Stop if we have enough unique persons
+                                if len(search_results) >= limit:
+                                    break
+                                    
+                        except Exception as e:
+                            logger.warning(f"Error processing search result: {e}")
+                            continue
             
-            logger.debug(f"Found {len(search_results)} similar faces")
-            return search_results
-
+            # Sort by distance (best matches first)
+            search_results.sort(key=lambda x: x.distance)
+            
+            logger.debug(f"Found {len(search_results)} unique matches")
+            return search_results[:limit]
+            
         except Exception as e:
-            logger.error(f"Error searching for similar faces: {e}")
-            raise Exception(f"Failed to search faces: {str(e)}")
+            logger.error(f"Search failed: {e}")
+            return []
     
     def exists(self, record_id: int) -> bool:
         """Check if a face exists by ID"""
