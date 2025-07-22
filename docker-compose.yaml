@@ -40,11 +40,11 @@ services:
       - FOWNER
       - SETGID
       - SETUID
-    deploy:
-      resources:
-        limits:
-          memory: 6G
-          cpus: '3.0'
-        reservations:
-          memory: 1G
-          cpus: '1.0'
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 6G
+    #       cpus: '3.0'
+    #     reservations:
+    #       memory: 1G
+    #       cpus: '1.0'
