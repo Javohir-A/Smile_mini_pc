@@ -43,17 +43,15 @@ class Camera:
         Returns:
             str: Formatted streaming URL.
         """
-        # If no credentials, use localhost default
-        if not self.username or not self.password:
-            return f"{protocol}://localhost:8554/mystream"
-        
-        # If no IP address or port, but have credentials, raise error
         if not self.ip_address or not self.port:
             raise ValueError("Camera IP address and port must be set")
 
-        auth_part = f"{self.username}:{self.password}@"
+        # If both username and password are missing or empty, skip auth part
+        use_auth = bool(self.username and self.password)
 
-        # Example stream paths by protocol
+        auth_part = f"{self.username}:{self.password}@" if use_auth else ""
+
+        # Default stream paths by protocol
         default_paths = {
             "rtsp": "/Streaming/Channels/102",
             "http": "/video",
@@ -61,6 +59,10 @@ class Camera:
             "rtmp": "/live/stream",
         }
 
-        path = default_paths.get(protocol.lower(), "/mystream")
+        # If no auth is used, and protocol is RTSP, fallback to /mystream
+        if not use_auth and protocol.lower() == "rtsp":
+            path = "/mystream"
+        else:
+            path = default_paths.get(protocol.lower(), "/mystream")
 
         return f"{protocol}://{auth_part}{self.ip_address}:{self.port}{path}"
