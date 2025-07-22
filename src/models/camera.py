@@ -43,12 +43,15 @@ class Camera:
         Returns:
             str: Formatted streaming URL.
         """
+        # If no credentials, use localhost default
+        if not self.username or not self.password:
+            return f"{protocol}://localhost:8554/mystream"
+        
+        # If no IP address or port, but have credentials, raise error
         if not self.ip_address or not self.port:
             raise ValueError("Camera IP address and port must be set")
 
-        auth_part = ""
-        if self.username and self.password:
-            auth_part = f"{self.username}:{self.password}@"
+        auth_part = f"{self.username}:{self.password}@"
 
         # Example stream paths by protocol
         default_paths = {
