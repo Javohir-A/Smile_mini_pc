@@ -48,7 +48,7 @@ class FaceDetectionProcessor:
         self.detection_lock = threading.Lock()
         
         # ULTRA OPTIMIZATION: Aggressive caching and processing intervals
-        self.face_cache: Dict[str, CachedFaceData] = {}  # Cache all face data
+        self.face_cache: Dict[str, Dict[str, CachedFaceData]] = {}  # stream_id -> {face_id -> cached_data}
         self.cache_timeout = 5.0  # Keep cache for 3 seconds
         
         # Recognition cache
@@ -76,6 +76,20 @@ class FaceDetectionProcessor:
         self.log_every_n_frames = 100  # Log detailed info only every 30 frames
         self.pose_process_every = 10
         self.pose_cache_ttl = 1.0
+
+        # Dynamic resolution and distance constraints
+        self.frame_resolution = None  # Will be set dynamically (width, height)
+        self.min_face_size_60cm = None  # Will be calculated based on resolution
+
+        # Cross-camera prevention (lightweight position-based)
+        self.global_face_positions = {}  # {face_id: (stream_id, x, y, timestamp)}
+
+        # Hardcode processing intervals (keep existing but set fixed values)
+        self.emotion_process_every = 2  # Fixed: every 2 frames
+        self.recognition_process_every = 5  # Fixed: every 5 frames
+
+        # ROI settings (center 80% of frame)
+        self.roi_percentage = 0.8  # Use center 80% of frame
 
         # Initialize all components
         self._initialize_models()
@@ -135,12 +149,14 @@ class FaceDetectionProcessor:
         HIGH_QUALITY_THRESHOLD = 1.5    # Frontal, good lighting
         NORMAL_THRESHOLD = 1.8          # Regular conditions  
         LOW_QUALITY_THRESHOLD = 2.0     # Poor lighting, angle
-    
-    # 2. ADD THESE METHODS AFTER YOUR EXISTING HELPER METHODS:
-    
-    def get_adaptive_threshold(self, face_id: str) -> float:
-        """Get adaptive threshold based on face quality"""
         
+    def get_adaptive_threshold(self, face_id: str) -> float:
+        cached_data = None
+        for stream_cache in self.face_cache.values():
+            if face_id in stream_cache:
+                cached_data = stream_cache[face_id]
+                break
+            
         cached_data = self.face_cache.get(face_id)
         if not cached_data or not hasattr(cached_data, 'pose_info'):
             return self.ConservativeRecognitionSettings.NORMAL_THRESHOLD
@@ -332,6 +348,42 @@ class FaceDetectionProcessor:
         else:
             logger.info("Face usecase is ready for face recognition")
     
+    def _calculate_distance_face_size(self, frame_width: int, frame_height: int, distance_cm: int) -> int:
+        """Calculate minimum face size for given distance based on resolution"""
+        # At given distance, average face is about 12-15cm wide
+        # Scale face size based on distance (closer = larger, farther = smaller)
+        
+        base_face_size = None
+        if frame_width <= 640:
+            base_face_size = 80  # Base size for 640p at 60cm
+        elif frame_width <= 1280:
+            base_face_size = 120  # Base size for 720p at 60cm
+        elif frame_width <= 1920:
+            base_face_size = 180  # Base size for 1080p at 60cm
+        else:
+            base_face_size = 240  # Base size for 4K at 60cm
+        
+        # Scale based on distance (inverse relationship)
+        # At 30cm = 2x size, at 120cm = 0.5x size
+        scale_factor = 60 / distance_cm
+        return int(base_face_size * scale_factor)
+
+    def _set_frame_resolution(self, frame: np.ndarray):
+        """Set resolution once when first frame is processed"""
+        if self.frame_resolution is None:
+            h, w = frame.shape[:2]
+            self.frame_resolution = (w, h)
+            self.min_face_size_60cm = self._calculate_distance_face_size(w, h, 60)
+            logger.info(f"Dynamic resolution set: {w}x{h}, min face size for 60cm: {self.min_face_size_60cm}")
+
+    def _is_face_in_allowed_area(self, face_center_x: int, face_center_y: int, frame_width: int, frame_height: int) -> bool:
+        """Check if face center is within allowed ROI (center 80% of frame)"""
+        margin_x = frame_width * (1 - self.roi_percentage) / 2
+        margin_y = frame_height * (1 - self.roi_percentage) / 2
+        
+        return (margin_x <= face_center_x <= frame_width - margin_x and 
+                margin_y <= face_center_y <= frame_height - margin_y)
+        
     def _load_face_detection_model(self) -> bool:
         """Load the DNN face detection model with optimized settings"""
         try:
@@ -372,12 +424,14 @@ class FaceDetectionProcessor:
         logger.info(f"Added detection callback: {callback.__name__}")
 
 
-    def _get_cached_face_data(self, face_id: str) -> CachedFaceData:
+    def _get_cached_face_data(self, face_id: str, stream_id: str) -> CachedFaceData:
         """Get cached face data with better timeout handling"""
         current_time = time.time()
+        if stream_id not in self.face_cache:
+            self.face_cache[stream_id] = {}
         
-        if face_id in self.face_cache:
-            cached_data = self.face_cache[face_id]
+        if face_id in self.face_cache[stream_id]:
+            cached_data = self.face_cache[stream_id][face_id]
             
             # FIXED: Different timeouts for different data types
             recognition_timeout = 8.0  # Keep recognition longer
@@ -402,120 +456,67 @@ class FaceDetectionProcessor:
             last_update=current_time,
             pose_info=self._get_default_pose_info()
         )
-        self.face_cache[face_id] = new_cache_data
+        self.face_cache[stream_id][face_id] = new_cache_data
         return new_cache_data
 
     def _update_face_cache_async(self, face_id: str, face_roi_expanded: np.ndarray, 
-                        face_roi: np.ndarray, should_process_pose: bool = False):
-        """Enhanced with more frequent and accurate database searches"""
+                        face_roi: np.ndarray, should_process_pose: bool = False, stream_id: str = None):
+        
         def background_update():
             try:
+                # Prevent duplicate processing
                 with self.recognition_lock:
                     if face_id in self.recognition_in_progress:
                         return
                     self.recognition_in_progress.add(face_id)
                 
                 current_time = time.time()
-                cached_data = self.face_cache.get(face_id)
+                cached_data = self.face_cache.get(stream_id, {}).get(face_id)
                 if not cached_data:
                     return
 
-                # MORE FREQUENT DATABASE CHECKS - especially for unrecognized faces
-                should_check_recognition = (
-                    not cached_data.is_recognized or  # Always check unrecognized
-                    (current_time - cached_data.last_update) > 3.0 or  # Reduced from 8.0
-                    cached_data.update_count % 15 == 0  # Every 15 updates, re-verify
-                )
+                # Store original recognition state
+                original_recognized = cached_data.is_recognized
+                original_name = cached_data.human_name
+                original_guid = cached_data.human_guid
+                original_confidence = cached_data.recognition_confidence
+
+                # Ensure pose info exists
+                if not hasattr(cached_data, 'pose_info') or cached_data.pose_info is None:
+                    cached_data.pose_info = self._get_default_pose_info()
+
+                # === RECOGNITION PROCESSING ===
+                self._process_recognition(cached_data, face_roi_expanded, face_id, current_time)
                 
-                if (self.face_recognizer and self.face_recognizer.available and 
-                    self.face_usecase and should_check_recognition):
-                    
-                    logger.debug(f"🔍 Database search for face {face_id} (updates: {cached_data.update_count})")
-                    
-                    face_embedding = self.face_recognizer.extract_face_embedding(face_roi_expanded, face_id)
-                    
-                    if face_embedding:
-                        # MULTI-THRESHOLD SEARCH for better accuracy
-                        search_results = self._multi_threshold_search(face_embedding, face_id)
-                        
-                        if search_results:
-                            best_match = search_results[0]
-                            confidence = self._calculate_recognition_confidence(best_match.distance)
-                            
-                            # STRICTER VALIDATION but allow updates
-                            if self._validate_face_match_enhanced(best_match, search_results, cached_data):
-                                # Update recognition data
-                                old_name = cached_data.human_name
-                                cached_data.human_guid = best_match.human_guid
-                                cached_data.human_name = best_match.name
-                                cached_data.human_type = best_match.human_type
-                                cached_data.recognition_confidence = confidence
-                                cached_data.is_recognized = True
-                                
-                                if old_name != best_match.name:
-                                    logger.info(f"✅ Face {face_id}: {old_name or 'Unknown'} -> {best_match.name} (conf: {confidence:.3f})")
-                            else:
-                                logger.debug(f"❌ Face {face_id}: Match rejected (validation failed)")
-
-                # Process emotions for all faces
-                if self.emotion_recognizer and self.emotion_recognizer.available:
-                    emotion_result = self.emotion_recognizer.predict_emotion(face_roi, face_id)
-                    if emotion_result and len(emotion_result) >= 2:
-                        emotion, emotion_conf = emotion_result[0], emotion_result[1]
-                        if emotion and emotion_conf > 0.1:
-                            cached_data.emotion = emotion
-                            cached_data.emotion_confidence = emotion_conf
-
+                # === PREVENT RECOGNITION LOSS ===
+                if not cached_data.is_recognized and original_recognized:
+                    logger.warning(f"Recognition lost for {face_id}, restoring previous state")
+                    cached_data.is_recognized = original_recognized
+                    cached_data.human_name = original_name
+                    cached_data.human_guid = original_guid
+                    cached_data.recognition_confidence = max(0.7, original_confidence)
+                
+                # === EMOTION PROCESSING ===
+                self._process_emotion(cached_data, face_roi, face_id)
+                
+                # Update timestamp
                 cached_data.last_update = current_time
                 cached_data.update_count += 1
 
             except Exception as e:
                 logger.error(f"Background face update error for {face_id}: {e}")
             finally:
+                # Always cleanup
                 with self.recognition_lock:
                     self.recognition_in_progress.discard(face_id)
                 self.pending_background_tasks.discard(face_id)
 
-        # Execute background update
+        # Submit background task
         if face_id not in self.pending_background_tasks:
             self.pending_background_tasks.add(face_id)
             self.background_executor.submit(background_update)
 
-    def _validate_face_match_enhanced(self, best_match, all_results, cached_data):
-        """Enhanced validation with better logic"""
-        # Distance check
-        if best_match.distance > 2.0:
-            logger.debug(f"Rejected: distance too high ({best_match.distance:.3f})")
-            return False
-        
-        # Confidence gap check for ambiguous matches
-        if len(all_results) > 1:
-            second_best = all_results[1] 
-            gap = second_best.distance - best_match.distance
-            
-            # Dynamic gap requirement based on distance
-            if best_match.distance < 1.0:
-                required_gap = 0.15
-            elif best_match.distance < 1.5:
-                required_gap = 0.2
-            else:
-                required_gap = 0.3
-                
-            if gap < required_gap:
-                logger.debug(f"Rejected: insufficient confidence gap ({gap:.3f} < {required_gap:.3f})")
-                return False
-        
-        # Consistency check - don't change identity too frequently
-        if (cached_data.is_recognized and cached_data.human_name and 
-            cached_data.human_name != best_match.name):
-            
-            # Require higher confidence to change identity
-            if best_match.distance > 0.8:
-                logger.debug(f"Rejected: identity change requires higher confidence")
-                return False
-        
-        return True
-    
+
     def _process_recognition(self, cached_data, face_roi_expanded, face_id, current_time):
         """Handle recognition processing separately"""
         if not (self.face_recognizer and self.face_recognizer.available and self.face_usecase):
@@ -624,10 +625,15 @@ class FaceDetectionProcessor:
         width = x2 - x1
         height = y2 - y1
         
-        # Skip tiny faces
-        if width < 30 or height < 30:
-            return None, None, None, None, None, None
+        # # Skip tiny faces
+        # if width < 30 or height < 30:
+        #     return None, None, None, None, None, None
         
+        # Skip faces smaller than 60cm distance (dynamic based on resolution)
+        min_size = self.min_face_size_60cm if self.min_face_size_60cm else 80
+        if width < min_size or height < min_size:
+            logger.debug(f"Face too small for 60cm constraint: {width}x{height} < {min_size}")
+            return None, None, None, None, None, None
         # Calculate expanded ROI
         expand_ratio = 0.2
         expand_x = int(width * expand_ratio / 2)
@@ -653,8 +659,8 @@ class FaceDetectionProcessor:
     
     def _process_single_detection(self, frame: np.ndarray, detection: np.ndarray, 
                                 w: int, h: int, should_process_recognition: bool,
-                                should_process_emotion: bool, should_process_pose: bool) -> Optional[FaceDetection]:
-        """Process a single face detection - OPTIMIZED WITH BETTER UNKNOWN FACE PROCESSING"""
+                                should_process_emotion: bool, should_process_pose: bool,
+                                stream_id: str) -> Optional[FaceDetection]:
         confidence = detection[2]
         
         if confidence <= self.min_confidence:
@@ -668,13 +674,12 @@ class FaceDetectionProcessor:
         x1, y1, width, height, face_roi_expanded, face_roi = result
         
         # Get face ID and cached data
-        face_id = self._assign_face_id(x1, y1, width, height)
-        cached_data = self._get_cached_face_data(face_id)
-        
+        face_id = self._assign_face_id(x1, y1, width, height, stream_id)
+        cached_data = self._get_cached_face_data(face_id, stream_id)
+                
         # Background processing for expensive operations
-        if (should_process_recognition or should_process_emotion or should_process_pose) and face_roi.size > 0:
-            self._update_face_cache_async(face_id, face_roi_expanded, face_roi, 
-                                        should_process_pose)
+        self._update_face_cache_async(face_id, face_roi_expanded, face_roi, 
+                                    should_process_pose, stream_id)
 
         # Create face detection object
         face_detection = self._create_face_detection_object(x1, y1, width, height, confidence, face_id, cached_data)
@@ -697,7 +702,7 @@ class FaceDetectionProcessor:
                 logger.info(f"🚀 SUBMITTING unknown face processing for {face_id}")
                 try:
                     self.background_executor.submit(
-                        self._process_unknown_face, face_roi, face_detection
+                        self._process_unknown_face, face_roi, face_detection, stream_id
                     )
                 except Exception as e:
                     logger.error(f"❌ Error submitting unknown face processing: {e}")
@@ -718,8 +723,13 @@ class FaceDetectionProcessor:
             if hasattr(self.emotion_recognizer, 'clear_emotion_cache'):
                 self.emotion_recognizer.clear_emotion_cache()
                 logger.debug("🎭 Cleared emotion cache for dynamic updates")
+        
+        # frame resolution dynamically on first frame
+        frame = frame_data.frame
+        self._set_frame_resolution(frame)
+    
         try:
-            frame = frame_data.frame
+            # frame = frame_data.frame
             h, w = frame.shape[:2]
             
             # Face detection
@@ -737,9 +747,21 @@ class FaceDetectionProcessor:
             # Process filtered detections
             face_detections = []
             for detection in filtered_detections:
+                x1 = max(0, int(detection[3] * w))
+                y1 = max(0, int(detection[4] * h))
+                x2 = min(w, int(detection[5] * w))
+                y2 = min(h, int(detection[6] * h))
+    
+                face_center_x = (x1 + x2) // 2
+                face_center_y = (y1 + y2) // 2
+                if not self._is_face_in_allowed_area(face_center_x, face_center_y, w, h):
+                    logger.info(f"Face outside ROI at ({face_center_x}, {face_center_y}), skipping")
+                    continue
+                
                 face_detection = self._process_single_detection(
                     frame, detection, w, h, 
-                    should_process_recognition, should_process_emotion, should_process_pose
+                    should_process_recognition, should_process_emotion, should_process_pose,
+                    frame_data.stream_id
                 )
                 if face_detection:
                     face_detections.append(face_detection)
@@ -795,77 +817,108 @@ class FaceDetectionProcessor:
         with self.detection_lock:
             return self.stream_detections.get(stream_id)
 
-    # In face_detection_processor.py - improve existing _assign_face_id method
-    def _assign_face_id(self, x: int, y: int, width: int, height: int) -> str:
-        """Enhanced face ID assignment with distance-aware tracking"""
+    def _assign_face_id(self, x: int, y: int, width: int, height: int, stream_id: str) -> str:
+        """FIXED: Better face tracking to prevent multiple boxes for same person"""
+        
         center_x = x + width // 2
         center_y = y + height // 2
         current_time = time.time()
-        face_area = width * height
+    
+        if stream_id not in self.face_cache:
+            self.face_cache[stream_id] = {}
+            
+        # Cross-camera prevention: Check if face exists in other streams
+        for existing_face_id, (existing_stream_id, existing_x, existing_y, timestamp) in self.global_face_positions.items():
+            if existing_stream_id != stream_id:  # Different camera
+                distance = (center_x - existing_x) ** 2 + (center_y - existing_y) ** 2
+                if distance < 30000 and (current_time - timestamp) < 5.0:  # Same person, different camera
+                    logger.debug(f"Face already tracked in stream {existing_stream_id}, skipping in {stream_id}")
+                    return existing_face_id
         
-        # Dynamic distance threshold based on face size (smaller faces = closer threshold)
-        base_threshold = 15000
-        size_factor = max(0.3, min(2.0, (width + height) / 200))  # Scale with face size
-        distance_threshold = base_threshold * size_factor
+        recognized_distance_threshold = 50000  # Larger threshold for recognized faces
+        unknown_distance_threshold = 30000     # Smaller threshold for unknown faces
+        overlap_threshold = 0.3
         
-        best_match = None
-        best_score = float('inf')
+        # CRITICAL FIX: Increase distance threshold to merge closer faces
+        # distance_threshold = 40000  # Increased from 25000 to prevent duplicate boxes
+        overlap_threshold = 0.3     # NEW: Check for overlapping faces
         
-        # Clean old faces first
-        for face_id in list(self.face_positions.keys()):
-            if current_time - self.face_positions[face_id]['last_seen'] > 5.0:
-                del self.face_positions[face_id]
+        min_distance = float('inf')
+        closest_id = None
         
-        # Find best matching existing face
-        for existing_face_id, info in self.face_positions.items():
-            if current_time - info['last_seen'] > 2.0:
-                continue
+        # Enhanced cleanup - more aggressive
+        if self.frame_counter % 90 == 0:  # Every 3 seconds
+            timeout_unrecognized = 5.0    # Faster cleanup
+            timeout_recognized = 12.0     
+            
+            to_remove = []
+            for fid, (_, _, timestamp) in self.face_tracker.items():
+                cached_data = self.face_cache.get(stream_id, {}).get(fid)
+                is_recognized = cached_data and cached_data.is_recognized
                 
-            # Position distance
-            pos_distance = ((center_x - info['center_x']) ** 2 + 
-                        (center_y - info['center_y']) ** 2) ** 0.5
-            
-            # Size continuity check - allow significant size changes for distance
-            old_area = info.get('area', face_area)
-            size_ratio = min(face_area, old_area) / max(face_area, old_area)
-            
-            # Accept size changes from 0.3x to 3x (people moving closer/farther)
-            if size_ratio < 0.3:
-                continue
+                timeout = timeout_recognized if is_recognized else timeout_unrecognized
                 
-            # Combined score: position + size consistency
-            size_penalty = (1.0 - size_ratio) * 5000  # Penalty for size change
-            total_score = pos_distance + size_penalty
+                if current_time - timestamp > timeout:
+                    to_remove.append(fid)
             
-            if total_score < distance_threshold and total_score < best_score:
-                best_match = existing_face_id
-                best_score = total_score
+            for fid in to_remove:
+                self.face_tracker.pop(fid, None)
+                # Clean up all related data
+                self.face_cache.pop(fid, None)
+                if hasattr(self.face_recognizer, 'embedding_cache'):
+                    cache_key = f"{fid}_embedding"
+                    self.face_recognizer.embedding_cache.pop(cache_key, None)
+                self.unknown_person_manager.cleanup_face(fid)
+                logger.debug(f"Cleaned up old face: {fid}")
         
-        if best_match:
-            # Update existing face with new position and size
-            self.face_positions[best_match].update({
-                'center_x': center_x,
-                'center_y': center_y,
-                'last_seen': current_time,
-                'area': face_area,
-                'width': width,
-                'height': height
-            })
-            return best_match
+        # CRITICAL FIX: Check for overlapping faces
+        # for face_id, (prev_x, prev_y, timestamp) in self.face_tracker.items():
+        #     distance = (center_x - prev_x) ** 2 + (center_y - prev_y) ** 2
+            
+        #     # Calculate overlap percentage
+        #     overlap = self._calculate_overlap_percentage(x, y, width, height, prev_x, prev_y, width, height)
+            
+        #     # Use either distance OR overlap criteria
+        #     if (distance < distance_threshold) or (overlap > overlap_threshold):
+        #         if distance < min_distance:
+        #             min_distance = distance
+        #             closest_id = face_id
+        # CRITICAL FIX: Check for overlapping faces with dynamic thresholds
+        
+        for face_id, (prev_x, prev_y, timestamp) in self.face_tracker.items():
+            distance = (center_x - prev_x) ** 2 + (center_y - prev_y) ** 2
+            
+            # Get cached data to check if face is recognized
+            cached_data = self.face_cache.get(stream_id, {}).get(face_id)
+            is_recognized = cached_data and cached_data.is_recognized
+            
+            # Use different thresholds for recognized vs unknown faces
+            current_threshold = recognized_distance_threshold if is_recognized else unknown_distance_threshold
+            
+            # Calculate overlap percentage
+            overlap = self._calculate_overlap_percentage(x, y, width, height, prev_x, prev_y, width, height)
+            
+            # Use either distance OR overlap criteria with dynamic threshold
+            if (distance < current_threshold) or (overlap > overlap_threshold):
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_id = face_id
+                    
+        if closest_id:
+            self.face_tracker[closest_id] = (center_x, center_y, current_time)
+            # ADD: Update global face positions for cross-camera prevention
+            self.global_face_positions[closest_id] = (stream_id, center_x, center_y, current_time)
+            logger.debug(f"Updated existing face ID: {closest_id}")
+            return closest_id
         else:
-            # Create new face ID
-            new_face_id = f"face_{int(current_time * 1000)}_{len(self.face_positions)}"
-            self.face_positions[new_face_id] = {
-                'center_x': center_x,
-                'center_y': center_y,
-                'last_seen': current_time,
-                'area': face_area,
-                'width': width,
-                'height': height,
-                'creation_time': current_time
-            }
-            return new_face_id
-        
+            new_id = f"face_{self.next_face_id:03d}"
+            self.next_face_id += 1
+            self.face_tracker[new_id] = (center_x, center_y, current_time)
+            # ADD: Update global face positions for cross-camera prevention
+            self.global_face_positions[new_id] = (stream_id, center_x, center_y, current_time)
+            logger.debug(f"Created new face ID: {new_id}")
+            return new_id
+
     def _filter_overlapping_detections(self, detections) -> list:
         """Filter out overlapping face detections before processing"""
         if len(detections) <= 1:
@@ -901,40 +954,7 @@ class FaceDetectionProcessor:
         
         logger.debug(f"Filtered {len(detections)} detections to {len(filtered)} unique faces")
         return filtered
-    
-    # Add this method to face_detection_processor.py
-    def _multi_threshold_search(self, face_embedding, face_id):
-        """Multi-threshold search for better accuracy"""
-        # Progressive search with different thresholds
-        thresholds = [1.0, 1.5, 2.0, 2.5]  # L2 distances
-        
-        for threshold in thresholds:
-            try:
-                search_results = self.face_usecase.search_similar_faces(
-                    face_embedding, limit=5, threshold=threshold
-                )
-                
-                if search_results:
-                    logger.debug(f"Found {len(search_results)} matches at threshold {threshold} for {face_id}")
-                    # Log top matches for debugging
-                    for i, match in enumerate(search_results[:3]):
-                        conf = self._calculate_recognition_confidence(match.distance)
-                        logger.debug(f"  {i+1}. {match.name}: distance={match.distance:.3f}, conf={conf:.3f}")
-                    
-                    # If we have a strong match (distance < 1.2), use it
-                    if search_results[0].distance < 1.2:
-                        return search_results
-                        
-                    # If we have matches, continue to validation
-                    if len(search_results) > 0:
-                        return search_results
-                        
-            except Exception as e:
-                logger.error(f"Search error at threshold {threshold}: {e}")
-                continue
-        
-        return []
-    
+
     def _calculate_detection_overlap(self, x1, y1, x2, y2, ax1, ay1, ax2, ay2) -> float:
         """Calculate overlap between two detection boxes"""
         try:
@@ -1203,13 +1223,17 @@ class FaceDetectionProcessor:
                     'face_usecase': self.face_usecase is not None
                 }
             }
-    
+            
     def cleanup(self):
         """Cleanup resources"""
         if self.background_executor:
             self.background_executor.shutdown(wait=True)
         self.face_tracker.clear()
         self.recognition_cache.clear()
+        # ADD: Clear global face positions
+        self.global_face_positions.clear()
+        # ADD: Clear face cache
+        self.face_cache.clear()
         with self.detection_lock:
             self.stream_detections.clear()
         logger.info("FaceDetectionProcessor cleaned up")
@@ -1223,8 +1247,8 @@ class FaceDetectionProcessor:
         quality_score = 0.0
         quality_reasons = []
         
-        # 1. Size check
-        min_face_size = 80
+        # 1. Size check (updated to 200x200 for better quality)
+        min_face_size = 200
         face_area = face_detection.width * face_detection.height
         if face_area >= min_face_size * min_face_size:
             quality_score += 0.2
@@ -1654,9 +1678,14 @@ class FaceDetectionProcessor:
         )
         
 # Replace the _process_unknown_face method with this corrected version:
-    def _process_unknown_face(self, face_roi: np.ndarray, face_detection: FaceDetection) -> bool:
+    def _process_unknown_face(self, face_roi: np.ndarray, face_detection: FaceDetection, stream_id: str) -> bool:
         """Process unknown face with enhanced duplicate prevention"""
         logger.info(f"🔎 ENTERED _process_unknown_face for {face_detection.face_id}")
+        
+        # ADD: Check minimum size for unknown face processing (200x200)
+        if face_detection.width < 200 or face_detection.height < 200:
+            logger.debug(f"Face too small for unknown processing: {face_detection.width}x{face_detection.height} < 200x200")
+            return False
         
         # ENHANCED: Multiple duplicate checks
         with self.unknown_processing_lock:
@@ -1712,7 +1741,7 @@ class FaceDetectionProcessor:
         # Database save check
         with self.unknown_processing_lock:
             # Re-check recognition status
-            cached_data = self.face_cache.get(face_detection.face_id)
+            cached_data = self.face_cache.get(stream_id, {}).get(face_detection.face_id)
             if cached_data and cached_data.is_recognized:
                 logger.info(f"STOPPING: {face_detection.face_id} was recognized as {cached_data.human_name} during processing")
                 self.unknown_person_manager.cleanup_face(face_detection.face_id)
@@ -1729,7 +1758,7 @@ class FaceDetectionProcessor:
                 
                 # Save to database
                 try:
-                    result = self._save_unknown_person_to_database(face_detection.face_id)
+                    result = self._save_unknown_person_to_database(face_detection.face_id, stream_id)
                     logger.info(f"📝 DATABASE SAVE RESULT for {face_detection.face_id}: {result}")
                     
                     # Mark processing end
@@ -1745,7 +1774,7 @@ class FaceDetectionProcessor:
         
         return False
 
-    def _save_unknown_person_to_database(self, face_id: str) -> bool:
+    def _save_unknown_person_to_database(self, face_id: str, stream_id: str) -> bool:
         """Save unknown person: best image -> UCode -> create human -> save face embedding"""
         import os, json, requests
                 
@@ -1932,13 +1961,22 @@ class FaceDetectionProcessor:
                 # Don't fail the whole process for this
             
             
-            if face_id in self.face_cache:
-                cached_data = self.face_cache[face_id]
-                # Reset recognition status to force fresh check
-                cached_data.is_recognized = False
-                cached_data.last_update = 0  # Force immediate update
-                logger.info(f"Reset cache for {face_id} to force recognition check") 
-            
+            # if face_id in self.face_cache:
+            #     cached_data = self.face_cache[face_id]
+            #     # Reset recognition status to force fresh check
+            #     cached_data.is_recognized = False
+            #     cached_data.last_update = 0  # Force immediate update
+            #     logger.info(f"Reset cache for {face_id} to force recognition check") 
+            stream_caches = list(self.face_cache.values())
+            for stream_cache in stream_caches:
+                if face_id in stream_cache:
+                    cached_data = stream_cache[face_id]
+                    # Reset recognition status to force fresh check
+                    cached_data.is_recognized = False
+                    cached_data.last_update = 0  # Force immediate update
+                    logger.info(f"Reset cache for {face_id} to force recognition check")
+                    break
+                
             if hasattr(self.face_recognizer, 'embedding_cache') and face_id in self.face_recognizer.embedding_cache:
                 del self.face_recognizer.embedding_cache[face_id]
                 logger.info(f"Cleared embedding cache for {face_id}")
