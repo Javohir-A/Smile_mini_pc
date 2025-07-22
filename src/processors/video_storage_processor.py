@@ -58,7 +58,8 @@ class AsyncVideoStorageProcessor:
         self.video_processing_queue = queue.Queue()
         self.video_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="video_processor")
         self.processing_workers_started = False
-        
+        self.cleanup_counter = 0
+
         # Setup directories with multiple fallback options
         self.video_dir = None
         self.temp_dir = None
@@ -259,7 +260,12 @@ class AsyncVideoStorageProcessor:
     def process_detection(self, detection_result: DetectionResult, frame: any):
         """Process detection and manage video sessions - NON-BLOCKING"""
         current_time = datetime.now()
-        
+        self.cleanup_counter += 1
+        if self.cleanup_counter % 1000 == 0:
+            try:
+                self._aggressive_memory_cleanup()
+            except Exception as e:
+                logger.error(f"❌ Video cleanup failed: {e}")
         with self.lock:
             # Only process if we have recognized faces
             recognized_faces = [f for f in detection_result.faces if f.is_recognized and f.human_guid]
@@ -334,6 +340,7 @@ class AsyncVideoStorageProcessor:
                     # Track frame timing for FPS calculation
                     session.frame_times.append(current_time)
 
+            self._force_cleanup_if_needed()
             # Check for people who disappeared
             self._check_session_timeouts(current_time, detection_result.stream_id, current_people)
             
@@ -389,14 +396,22 @@ class AsyncVideoStorageProcessor:
             human_type=human_type,
             emotion=emotion,
             start_time=start_time,
-            frames=deque(maxlen=900),  # 30 seconds at 30fps
+            frames=deque(maxlen=50),  # 30 seconds at 30fps
             camera_id=camera_id,
             last_seen=start_time,
-            frame_times=deque(maxlen=100)  # Track frame timing for FPS
+            frame_times=deque(maxlen=10)  # Track frame timing for FPS
         )
         
         self.active_sessions[human_id] = session
         logger.debug(f"▶️ Started video session: {human_name} - {emotion}")
+    
+    def _force_cleanup_if_needed(self):
+        """Force cleanup if too much memory is used"""
+        total_frames = sum(len(session.frames) for session in self.active_sessions.values())
+        
+        if total_frames > 200:  # More than 200 total frames across all sessions
+            logger.warning(f"🚨 High frame count: {total_frames}, forcing cleanup")
+            self._aggressive_memory_cleanup()
     
     def _create_web_compatible_video_async(self, session: PersonVideoSession, end_time: datetime) -> Optional[VideoRecord]:
         """Create web browser compatible video file in background thread"""
@@ -783,6 +798,49 @@ class AsyncVideoStorageProcessor:
         logger.info(f"   Calculated FPS: {calculated_fps:.1f}")
         
         return calculated_fps
+    
+    def _aggressive_memory_cleanup(self):
+        """Aggressive memory cleanup for video sessions"""
+        logger.info("🧹 Starting video memory cleanup...")
+        
+        try:
+            current_time = datetime.now()
+            cleanup_threshold = timedelta(seconds=10)  # Much shorter threshold
+            
+            sessions_to_remove = []
+            frames_cleared = 0
+            
+            for human_id, session in self.active_sessions.items():
+                # Force cleanup old sessions
+                if current_time - session.last_seen > cleanup_threshold:
+                    sessions_to_remove.append(human_id)
+                    frames_cleared += len(session.frames)
+                else:
+                    # Even for active sessions, limit frame buffer
+                    if len(session.frames) > 75:  # Keep only 75 frames max
+                        excess_frames = len(session.frames) - 75
+                        for _ in range(excess_frames):
+                            if session.frames:
+                                session.frames.popleft()
+                        frames_cleared += excess_frames
+            
+            # Remove old sessions
+            for human_id in sessions_to_remove:
+                session = self.active_sessions.pop(human_id, None)
+                if session:
+                    logger.info(f"🧹 Removed video session: {session.human_name}")
+                    session.frames.clear()
+                    del session
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            logger.info(f"🧹 Video cleanup complete: {frames_cleared} frames cleared, "
+                    f"{len(sessions_to_remove)} sessions removed")
+            
+        except Exception as e:
+            logger.error(f"❌ Video cleanup error: {e}")
 # Backward compatibility alias
 VideoStorageProcessor = AsyncVideoStorageProcessor
 

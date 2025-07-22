@@ -308,10 +308,10 @@ class StreamApplication:
                 memory_info = process.memory_info()
                 memory_mb = memory_info.rss / 1024 / 1024
                 
-                if memory_mb > 1000:  # Warn if over 1GB
+                if memory_mb > 3000:  # Warn if over 3GB
                     logger.warning(f"🧠 High memory usage: {memory_mb:.1f} MB")
                 
-                if memory_mb > 2000:  # Critical if over 2GB
+                if memory_mb > 6000:  # Critical if over 6GB
                     logger.critical(f"🚨 Critical memory usage: {memory_mb:.1f} MB - consider restarting")
                 
                 await asyncio.sleep(30)  # Check every 30 seconds

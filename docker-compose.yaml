@@ -32,6 +32,9 @@ services:
       - VIDEO_TRIGGER_EMOTIONS=upset,smile,normal
       - FFMPEG_ENABLED=true
       - OPENCV_FFMPEG_CAPTURE_OPTIONS=protocol_whitelist;file,rtp,udp
+      - PYTHONMALLOC=malloc
+      - MALLOC_TRIM_THRESHOLD_=100000
+    
     cap_drop:
       - ALL
     cap_add:
