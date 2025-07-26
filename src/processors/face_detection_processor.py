@@ -361,13 +361,13 @@ class FaceDetectionProcessor:
         
         base_face_size = None
         if frame_width <= 640:
-            base_face_size = 80  # Base size for 640p at 60cm
+            base_face_size = 100  # Base size for 640p at 60cm
         elif frame_width <= 1280:
-            base_face_size = 120  # Base size for 720p at 60cm
+            base_face_size = 220  # Base size for 720p at 60cm
         elif frame_width <= 1920:
-            base_face_size = 180  # Base size for 1080p at 60cm
+            base_face_size = 280  # Base size for 1080p at 60cm
         else:
-            base_face_size = 240  # Base size for 4K at 60cm
+            base_face_size = 340  # Base size for 4K at 60cm
         
         # Scale based on distance (inverse relationship)
         # At 30cm = 2x size, at 120cm = 0.5x size
