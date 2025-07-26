@@ -37,13 +37,7 @@ class FaceDetectionProcessor:
         self.next_face_id = 1
         self._lock = threading.Lock()
         self.min_face_size: Optional[int] = 80
-        
-        self.memory_cleanup_counter = 0
-        self.aggressive_cleanup_interval = 100
-        
-        self.max_cache_size_per_stream = 10  # Limit cache entries per stream
-        self.max_total_cache_size = 50 
-        
+
         self.emotion_cache_clear_every = 30  # Clear every 30 frames (1 second)
         self.ucode_api = new(config=Config(app_id=config.ucode.app_id, base_url=config.ucode.base_url))
         
@@ -55,11 +49,11 @@ class FaceDetectionProcessor:
         
         # ULTRA OPTIMIZATION: Aggressive caching and processing intervals
         self.face_cache: Dict[str, Dict[str, CachedFaceData]] = {}  # stream_id -> {face_id -> cached_data}
-        self.cache_timeout = 3.0  # Keep cache for 3 seconds
+        self.cache_timeout = 5.0  # Keep cache for 3 seconds
         
         # Recognition cache
         self.recognition_cache = {}
-        self.recognition_cache_timeout = 1.0  # Cache for 0.2 seconds
+        self.recognition_cache_timeout = 3.0  # Cache for 0.2 seconds
         
         # Processing intervals to reduce load
         self.emotion_process_every = 3  # Process emotion every 3 frames
@@ -435,16 +429,6 @@ class FaceDetectionProcessor:
         current_time = time.time()
         if stream_id not in self.face_cache:
             self.face_cache[stream_id] = {}
-
-        stream_cache = self.face_cache[stream_id]
-        
-        if len(stream_cache) >= self.max_cache_size_per_stream:
-            # Remove oldest entries
-            oldest_entries = sorted(stream_cache.items(), 
-                                key=lambda x: x[1].last_update)[:10]  # Remove 10 oldest
-            for old_face_id, _ in oldest_entries:
-                stream_cache.pop(old_face_id, None)
-                self.face_tracker.pop(old_face_id, None)  # Also clean tracker
         
         if face_id in self.face_cache[stream_id]:
             cached_data = self.face_cache[stream_id][face_id]
@@ -475,26 +459,19 @@ class FaceDetectionProcessor:
         self.face_cache[stream_id][face_id] = new_cache_data
         return new_cache_data
 
-
     def _update_face_cache_async(self, face_id: str, face_roi_expanded: np.ndarray, 
                         face_roi: np.ndarray, should_process_pose: bool = False, stream_id: str = None):
         
-        # FIX: Capture variables in the closure or pass them explicitly
-        def background_update(roi_expanded, roi_normal, target_face_id, target_stream_id):
+        def background_update():
             try:
                 # Prevent duplicate processing
                 with self.recognition_lock:
-                    if target_face_id in self.recognition_in_progress:
+                    if face_id in self.recognition_in_progress:
                         return
-                    self.recognition_in_progress.add(target_face_id)
+                    self.recognition_in_progress.add(face_id)
                 
                 current_time = time.time()
-                
-                # Access stream-specific cache properly
-                if target_stream_id not in self.face_cache:
-                    return
-                    
-                cached_data = self.face_cache[target_stream_id].get(target_face_id)
+                cached_data = self.face_cache.get(stream_id, {}).get(face_id)
                 if not cached_data:
                     return
 
@@ -509,37 +486,36 @@ class FaceDetectionProcessor:
                     cached_data.pose_info = self._get_default_pose_info()
 
                 # === RECOGNITION PROCESSING ===
-                self._process_recognition(cached_data, roi_expanded, target_face_id, current_time)
+                self._process_recognition(cached_data, face_roi_expanded, face_id, current_time)
                 
                 # === PREVENT RECOGNITION LOSS ===
                 if not cached_data.is_recognized and original_recognized:
-                    logger.warning(f"Recognition lost for {target_face_id}, restoring previous state")
+                    logger.warning(f"Recognition lost for {face_id}, restoring previous state")
                     cached_data.is_recognized = original_recognized
                     cached_data.human_name = original_name
                     cached_data.human_guid = original_guid
                     cached_data.recognition_confidence = max(0.7, original_confidence)
                 
                 # === EMOTION PROCESSING ===
-                self._process_emotion(cached_data, roi_normal, target_face_id)
+                self._process_emotion(cached_data, face_roi, face_id)
                 
                 # Update timestamp
                 cached_data.last_update = current_time
-                cached_data.update_count = getattr(cached_data, 'update_count', 0) + 1
+                cached_data.update_count += 1
 
             except Exception as e:
-                logger.error(f"Background face update error for {target_face_id}: {e}")
+                logger.error(f"Background face update error for {face_id}: {e}")
             finally:
                 # Always cleanup
                 with self.recognition_lock:
-                    self.recognition_in_progress.discard(target_face_id)
-                self.pending_background_tasks.discard(target_face_id)
+                    self.recognition_in_progress.discard(face_id)
+                self.pending_background_tasks.discard(face_id)
 
-        # Limit pending tasks to prevent memory buildup
-        if len(self.pending_background_tasks) < 20:
-            if face_id not in self.pending_background_tasks:
-                self.pending_background_tasks.add(face_id)
-                # FIX: Pass the variables as arguments
-                self.background_executor.submit(background_update, face_roi_expanded, face_roi, face_id, stream_id)
+        # Submit background task
+        if face_id not in self.pending_background_tasks:
+            self.pending_background_tasks.add(face_id)
+            self.background_executor.submit(background_update)
+
 
     def _process_recognition(self, cached_data, face_roi_expanded, face_id, current_time):
         """Handle recognition processing separately"""
@@ -730,24 +706,12 @@ class FaceDetectionProcessor:
                     )
                 except Exception as e:
                     logger.error(f"❌ Error submitting unknown face processing: {e}")
-            
-        # Immediately clear large image arrays after processing
-        face_detection = self._create_face_detection_object(x1, y1, width, height, confidence, face_id, cached_data)
-        
-        # Clear ROI images from memory immediately
-        del face_roi_expanded, face_roi
         
         return face_detection
 
 
     def process_frame(self, frame_data: FrameData) -> Optional[DetectionResult]:
-        
         """FIXED: Filter out duplicate faces and force emotion updates"""
-        self.memory_cleanup_counter += 1
-        if self.memory_cleanup_counter % self.aggressive_cleanup_interval == 0:
-            self._aggressive_memory_cleanup()
-        
-        
         if not self.net:
             return None
         
@@ -815,61 +779,6 @@ class FaceDetectionProcessor:
             if self.log_counter % 200 == 0:
                 logger.error(f"Frame processing error: {e}")
             return None
-
-    def _aggressive_memory_cleanup(self):
-        """Aggressive memory cleanup to prevent leaks"""
-        logger.info("🧹 Starting aggressive memory cleanup...")
-        
-        try:
-            # 1. Clear old face cache across all streams
-            current_time = time.time()
-            total_cleared = 0
-            
-            for stream_id in list(self.face_cache.keys()):
-                stream_cache = self.face_cache[stream_id]
-                to_remove = []
-                
-                for face_id, cached_data in stream_cache.items():
-                    if (current_time - cached_data.last_update) > 30.0:  # 30 seconds old
-                        to_remove.append(face_id)
-                
-                for face_id in to_remove:
-                    stream_cache.pop(face_id, None)
-                    total_cleared += 1
-            
-            # 2. Clean up face tracker
-            tracker_before = len(self.face_tracker)
-            to_remove = []
-            for face_id, (_, _, timestamp) in self.face_tracker.items():
-                if (current_time - timestamp) > 30.0:
-                    to_remove.append(face_id)
-            
-            for face_id in to_remove:
-                self.face_tracker.pop(face_id, None)
-            
-            # 3. Clean up global positions
-            to_remove = []
-            for face_id, (_, _, _, timestamp) in self.global_face_positions.items():
-                if (current_time - timestamp) > 30.0:
-                    to_remove.append(face_id)
-            
-            for face_id in to_remove:
-                self.global_face_positions.pop(face_id, None)
-            
-            # 4. Force unknown person manager cleanup
-            self.unknown_person_manager.cleanup_old_first_seen()
-            
-            # 5. Clear recognition cache
-            self.recognition_cache.clear()
-            
-            # 6. Force garbage collection
-            import gc
-            gc.collect()
-            
-            logger.info(f"🧹 Cleanup complete: {total_cleared} cache entries, {tracker_before - len(self.face_tracker)} trackers cleared")
-            
-        except Exception as e:
-            logger.error(f"Error in aggressive cleanup: {e}")
 
     def _create_detection_result(self, frame_data: FrameData, face_detections: list, start_time: float) -> DetectionResult:
         """Create DetectionResult object"""
@@ -2102,10 +2011,3 @@ class FaceDetectionProcessor:
         else:
             return str(obj)
 
-    def _monitor_cache_sizes(self):
-        """Monitor and log cache sizes"""
-        if self.frame_counter % 1000 == 0:  # Every ~30 seconds
-            total_cache_size = sum(len(cache) for cache in self.face_cache.values())
-            logger.info(f"📊 Cache sizes: face_cache={total_cache_size}, "
-                    f"face_tracker={len(self.face_tracker)}, "
-                    f"global_positions={len(self.global_face_positions)}")

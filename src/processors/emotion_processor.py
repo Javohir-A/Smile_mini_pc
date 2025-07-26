@@ -172,7 +172,7 @@ class SimpleEmotionProcessor:
         # Configuration
         self.timeout_seconds = 3.0
         self.min_duration = 0.5
-        self.video_wait_timeout = 30.0  # 30 seconds timeout for video
+        self.video_wait_timeout = 180.0  # 300 seconds timeout for video
         self.max_retry_attempts = 3
         
         # NEW: Confidence tracking settings
@@ -522,23 +522,29 @@ class SimpleEmotionProcessor:
                 logger.info(f"📹 Assigned video URL to {latest_emotion.human_name} - {emotion_type}")
     
     def _process_ready_emotions(self):
-        """Process emotions that are ready to be sent"""
+        """Process emotions that are ready to be sent - VIDEO-FIRST MODE"""
         ready_emotions = []
         
         with self.pending_lock:
             for emotion_id, emotion in self.pending_emotions.items():
-                # Send if: has video URL OR timeout reached OR no video expected
                 if not emotion.sent_to_api:
-                    if emotion.video_url or datetime.now() >= emotion.timeout_at:
+                    # Only send emotions that have video URLs
+                    if emotion.video_url:
                         ready_emotions.append(emotion_id)
+                        logger.info(f"✅ Emotion ready with video: {emotion.human_name} - {emotion.emotion_type}")
+                    elif datetime.now() >= emotion.timeout_at:
+                        # Extended timeout reached but still no video - skip this emotion
+                        emotion.sent_to_api = True  # Mark as processed (skipped)
+                        logger.warning(f"❌ Video timeout - skipping emotion: {emotion.human_name} - {emotion.emotion_type}")
+                        logger.info(f"   Waited {(datetime.now() - emotion.created_at).total_seconds():.1f} seconds for video")
         
-        # Send ready emotions
+        # Send ready emotions (uses existing RabbitMQ logic)
         for emotion_id in ready_emotions:
             with self.pending_lock:
                 if emotion_id in self.pending_emotions:
                     emotion = self.pending_emotions[emotion_id]
-                    self._send_emotion_to_api(emotion)
-        
+                    self._send_emotion_to_api(emotion)  # Existing method handles RabbitMQ publishing
+                    
     def _send_emotion_to_api(self, emotion: PendingEmotion):
         """Send emotion using new publisher with RabbitMQ and REST fallback"""
         try:
