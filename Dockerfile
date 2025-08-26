@@ -5,7 +5,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     build-essential cmake libpq-dev libboost-all-dev \
     libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
-    libopenblas-dev liblapack-dev libatlas-base-dev \
+    libopenblas-dev liblapack-dev \
     gfortran curl wget \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -21,7 +21,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     ffmpeg libpq-dev \
     libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
-    libopenblas-dev liblapack-dev libatlas-base-dev \
+    libopenblas-dev liblapack-dev  \
     iproute2 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 

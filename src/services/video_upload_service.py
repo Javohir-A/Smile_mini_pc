@@ -12,7 +12,6 @@ logging.basicConfig(level=logging.DEBUG)
 
 logger = logging.getLogger(__name__)
 
-# Import ucode-sdk based on your example
 try:
     from ucode_sdk.config import Config
     from ucode_sdk.sdk import new

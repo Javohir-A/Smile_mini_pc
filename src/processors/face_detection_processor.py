@@ -36,8 +36,14 @@ class FaceDetectionProcessor:
         self.face_tracker = {}  # For tracking faces across frames
         self.next_face_id = 1
         self._lock = threading.Lock()
-        self.min_face_size: Optional[int] = 80
-
+        self.min_face_size: Optional[int] = 150
+        
+        self.memory_cleanup_counter = 0
+        self.aggressive_cleanup_interval = 100
+        
+        self.max_cache_size_per_stream = 10  # Limit cache entries per stream
+        self.max_total_cache_size = 50 
+        
         self.emotion_cache_clear_every = 30  # Clear every 30 frames (1 second)
         self.ucode_api = new(config=Config(app_id=config.ucode.app_id, base_url=config.ucode.base_url))
         
@@ -49,11 +55,11 @@ class FaceDetectionProcessor:
         
         # ULTRA OPTIMIZATION: Aggressive caching and processing intervals
         self.face_cache: Dict[str, Dict[str, CachedFaceData]] = {}  # stream_id -> {face_id -> cached_data}
-        self.cache_timeout = 5.0  # Keep cache for 3 seconds
+        self.cache_timeout = 3.0  # Keep cache for 3 seconds
         
         # Recognition cache
         self.recognition_cache = {}
-        self.recognition_cache_timeout = 3.0  # Cache for 0.2 seconds
+        self.recognition_cache_timeout = 1.0  # Cache for 0.2 seconds
         
         # Processing intervals to reduce load
         self.emotion_process_every = 3  # Process emotion every 3 frames
@@ -373,16 +379,47 @@ class FaceDetectionProcessor:
         if self.frame_resolution is None:
             h, w = frame.shape[:2]
             self.frame_resolution = (w, h)
-            self.min_face_size_60cm = self._calculate_distance_face_size(w, h, 60)
+            self.min_face_size_60cm = self._calculate_distance_face_size(w, h, 100)
             logger.info(f"Dynamic resolution set: {w}x{h}, min face size for 60cm: {self.min_face_size_60cm}")
 
-    def _is_face_in_allowed_area(self, face_center_x: int, face_center_y: int, frame_width: int, frame_height: int) -> bool:
-        """Check if face center is within allowed ROI (center 80% of frame)"""
+    def _is_face_in_allowed_area(self, face_x: int, face_y: int, face_width: int, face_height: int, frame_width: int, frame_height: int) -> bool:
+        """
+        Check if ENTIRE FACE RECTANGLE is within allowed ROI (center 80% of frame)
+        CHANGED: Now checks full face appearance, not just center point
+        """
+        # Calculate ROI boundaries
         margin_x = frame_width * (1 - self.roi_percentage) / 2
         margin_y = frame_height * (1 - self.roi_percentage) / 2
         
-        return (margin_x <= face_center_x <= frame_width - margin_x and 
-                margin_y <= face_center_y <= frame_height - margin_y)
+        roi_left = int(margin_x)
+        roi_top = int(margin_y)
+        roi_right = int(frame_width - margin_x)
+        roi_bottom = int(frame_height - margin_y)
+        
+        # Calculate face rectangle boundaries
+        face_left = face_x
+        face_top = face_y
+        face_right = face_x + face_width
+        face_bottom = face_y + face_height
+        
+        # CHECK: Entire face must be within ROI boundaries
+        face_fully_inside = (
+            face_left >= roi_left and       # Left edge inside
+            face_top >= roi_top and         # Top edge inside  
+            face_right <= roi_right and     # Right edge inside
+            face_bottom <= roi_bottom       # Bottom edge inside
+        )
+        
+        # Enhanced logging for debugging
+        if not face_fully_inside:
+            logger.debug(f"Face REJECTED - not fully inside ROI:")
+            logger.debug(f"  Face bounds: ({face_left},{face_top}) to ({face_right},{face_bottom})")
+            logger.debug(f"  ROI bounds:  ({roi_left},{roi_top}) to ({roi_right},{roi_bottom})")
+        else:
+            logger.debug(f"Face ACCEPTED - fully inside ROI: {face_width}x{face_height} at ({face_x},{face_y})")
+        
+        return face_fully_inside
+
         
     def _load_face_detection_model(self) -> bool:
         """Load the DNN face detection model with optimized settings"""
@@ -429,6 +466,16 @@ class FaceDetectionProcessor:
         current_time = time.time()
         if stream_id not in self.face_cache:
             self.face_cache[stream_id] = {}
+
+        stream_cache = self.face_cache[stream_id]
+        
+        if len(stream_cache) >= self.max_cache_size_per_stream:
+            # Remove oldest entries
+            oldest_entries = sorted(stream_cache.items(), 
+                                key=lambda x: x[1].last_update)[:10]  # Remove 10 oldest
+            for old_face_id, _ in oldest_entries:
+                stream_cache.pop(old_face_id, None)
+                self.face_tracker.pop(old_face_id, None)  # Also clean tracker
         
         if face_id in self.face_cache[stream_id]:
             cached_data = self.face_cache[stream_id][face_id]
@@ -459,19 +506,26 @@ class FaceDetectionProcessor:
         self.face_cache[stream_id][face_id] = new_cache_data
         return new_cache_data
 
+
     def _update_face_cache_async(self, face_id: str, face_roi_expanded: np.ndarray, 
                         face_roi: np.ndarray, should_process_pose: bool = False, stream_id: str = None):
         
-        def background_update():
+        # FIX: Capture variables in the closure or pass them explicitly
+        def background_update(roi_expanded, roi_normal, target_face_id, target_stream_id):
             try:
                 # Prevent duplicate processing
                 with self.recognition_lock:
-                    if face_id in self.recognition_in_progress:
+                    if target_face_id in self.recognition_in_progress:
                         return
-                    self.recognition_in_progress.add(face_id)
+                    self.recognition_in_progress.add(target_face_id)
                 
                 current_time = time.time()
-                cached_data = self.face_cache.get(stream_id, {}).get(face_id)
+                
+                # Access stream-specific cache properly
+                if target_stream_id not in self.face_cache:
+                    return
+                    
+                cached_data = self.face_cache[target_stream_id].get(target_face_id)
                 if not cached_data:
                     return
 
@@ -486,36 +540,37 @@ class FaceDetectionProcessor:
                     cached_data.pose_info = self._get_default_pose_info()
 
                 # === RECOGNITION PROCESSING ===
-                self._process_recognition(cached_data, face_roi_expanded, face_id, current_time)
+                self._process_recognition(cached_data, roi_expanded, target_face_id, current_time)
                 
                 # === PREVENT RECOGNITION LOSS ===
                 if not cached_data.is_recognized and original_recognized:
-                    logger.warning(f"Recognition lost for {face_id}, restoring previous state")
+                    logger.warning(f"Recognition lost for {target_face_id}, restoring previous state")
                     cached_data.is_recognized = original_recognized
                     cached_data.human_name = original_name
                     cached_data.human_guid = original_guid
                     cached_data.recognition_confidence = max(0.7, original_confidence)
                 
                 # === EMOTION PROCESSING ===
-                self._process_emotion(cached_data, face_roi, face_id)
+                self._process_emotion(cached_data, roi_normal, target_face_id)
                 
                 # Update timestamp
                 cached_data.last_update = current_time
-                cached_data.update_count += 1
+                cached_data.update_count = getattr(cached_data, 'update_count', 0) + 1
 
             except Exception as e:
-                logger.error(f"Background face update error for {face_id}: {e}")
+                logger.error(f"Background face update error for {target_face_id}: {e}")
             finally:
                 # Always cleanup
                 with self.recognition_lock:
-                    self.recognition_in_progress.discard(face_id)
-                self.pending_background_tasks.discard(face_id)
+                    self.recognition_in_progress.discard(target_face_id)
+                self.pending_background_tasks.discard(target_face_id)
 
-        # Submit background task
-        if face_id not in self.pending_background_tasks:
-            self.pending_background_tasks.add(face_id)
-            self.background_executor.submit(background_update)
-
+        # Limit pending tasks to prevent memory buildup
+        if len(self.pending_background_tasks) < 20:
+            if face_id not in self.pending_background_tasks:
+                self.pending_background_tasks.add(face_id)
+                # FIX: Pass the variables as arguments
+                self.background_executor.submit(background_update, face_roi_expanded, face_roi, face_id, stream_id)
 
     def _process_recognition(self, cached_data, face_roi_expanded, face_id, current_time):
         """Handle recognition processing separately"""
@@ -661,6 +716,7 @@ class FaceDetectionProcessor:
                                 w: int, h: int, should_process_recognition: bool,
                                 should_process_emotion: bool, should_process_pose: bool,
                                 stream_id: str) -> Optional[FaceDetection]:
+        """Process single detection - ROI check already done in process_frame"""
         confidence = detection[2]
         
         if confidence <= self.min_confidence:
@@ -673,6 +729,9 @@ class FaceDetectionProcessor:
         
         x1, y1, width, height, face_roi_expanded, face_roi = result
         
+        # REMOVE: Old ROI check that was here
+        # The ROI check is now done in process_frame BEFORE calling this method
+        
         # Get face ID and cached data
         face_id = self._assign_face_id(x1, y1, width, height, stream_id)
         cached_data = self._get_cached_face_data(face_id, stream_id)
@@ -684,22 +743,18 @@ class FaceDetectionProcessor:
         # Create face detection object
         face_detection = self._create_face_detection_object(x1, y1, width, height, confidence, face_id, cached_data)
         
-        # IMPROVED: Process unknown faces more frequently (every 3 frames instead of every 10)
+        # Process unknown faces
         should_process_unknown = (
-            self.frame_counter % 30 == 0 and  # Only every 30 frames (once per second)
+            self.frame_counter % 30 == 0 and
             face_id not in self.unknown_person_manager.processing_faces and
             face_id not in self.unknown_person_manager.saved_faces
         )
-        
-        logger.debug(f"🔍 DEBUG: face_id={face_id}, is_recognized={face_detection.is_recognized}, frame_counter={self.frame_counter}, should_process_unknown={should_process_unknown}")
         
         if not face_detection.is_recognized and should_process_unknown:
             current_time = time.time()
             last_seen = self.unknown_person_manager.face_first_seen.get(face_id, 0)
             
-            # Only submit if we haven't recently processed this face
             if current_time - last_seen > 10.0 or face_id not in self.unknown_person_manager.face_first_seen:
-                logger.info(f"🚀 SUBMITTING unknown face processing for {face_id}")
                 try:
                     self.background_executor.submit(
                         self._process_unknown_face, face_roi, face_detection, stream_id
@@ -707,11 +762,17 @@ class FaceDetectionProcessor:
                 except Exception as e:
                     logger.error(f"❌ Error submitting unknown face processing: {e}")
         
+        # Clean up memory
+        del face_roi_expanded, face_roi
+        
         return face_detection
 
-
     def process_frame(self, frame_data: FrameData) -> Optional[DetectionResult]:
-        """FIXED: Filter out duplicate faces and force emotion updates"""
+        """Process a single frame with full face ROI constraint"""
+        self.memory_cleanup_counter += 1
+        if self.memory_cleanup_counter % self.aggressive_cleanup_interval == 0:
+            self._aggressive_memory_cleanup()
+        
         if not self.net:
             return None
         
@@ -724,12 +785,11 @@ class FaceDetectionProcessor:
                 self.emotion_recognizer.clear_emotion_cache()
                 logger.debug("🎭 Cleared emotion cache for dynamic updates")
         
-        # frame resolution dynamically on first frame
+        # Set frame resolution dynamically on first frame
         frame = frame_data.frame
         self._set_frame_resolution(frame)
-    
+
         try:
-            # frame = frame_data.frame
             h, w = frame.shape[:2]
             
             # Face detection
@@ -747,24 +807,31 @@ class FaceDetectionProcessor:
             # Process filtered detections
             face_detections = []
             for detection in filtered_detections:
+                # Extract face coordinates FIRST
                 x1 = max(0, int(detection[3] * w))
                 y1 = max(0, int(detection[4] * h))
                 x2 = min(w, int(detection[5] * w))
                 y2 = min(h, int(detection[6] * h))
-    
-                face_center_x = (x1 + x2) // 2
-                face_center_y = (y1 + y2) // 2
-                if not self._is_face_in_allowed_area(face_center_x, face_center_y, w, h):
-                    logger.info(f"Face outside ROI at ({face_center_x}, {face_center_y}), skipping")
-                    continue
+
+                face_width = x2 - x1
+                face_height = y2 - y1
                 
+                # ADD: Full face ROI constraint check
+                if not self._is_face_in_allowed_area(x1, y1, face_width, face_height, w, h):
+                    logger.debug(f"Face REJECTED - extends outside ROI: {face_width}x{face_height} at ({x1},{y1})")
+                    continue  # Skip this face completely
+                
+                # Process the face (existing logic)
                 face_detection = self._process_single_detection(
                     frame, detection, w, h, 
                     should_process_recognition, should_process_emotion, should_process_pose,
                     frame_data.stream_id
                 )
+                
                 if face_detection:
                     face_detections.append(face_detection)
+                    logger.debug(f"Face ACCEPTED: {face_detection.human_name or 'Unknown'} "
+                            f"fully inside ROI: {face_width}x{face_height}")
             
             # CRITICAL FIX: Remove duplicate faces by name/position
             unique_face_detections = self._remove_duplicate_faces(face_detections)
@@ -779,6 +846,61 @@ class FaceDetectionProcessor:
             if self.log_counter % 200 == 0:
                 logger.error(f"Frame processing error: {e}")
             return None
+
+    def _aggressive_memory_cleanup(self):
+        """Aggressive memory cleanup to prevent leaks"""
+        logger.info("🧹 Starting aggressive memory cleanup...")
+        
+        try:
+            # 1. Clear old face cache across all streams
+            current_time = time.time()
+            total_cleared = 0
+            
+            for stream_id in list(self.face_cache.keys()):
+                stream_cache = self.face_cache[stream_id]
+                to_remove = []
+                
+                for face_id, cached_data in stream_cache.items():
+                    if (current_time - cached_data.last_update) > 30.0:  # 30 seconds old
+                        to_remove.append(face_id)
+                
+                for face_id in to_remove:
+                    stream_cache.pop(face_id, None)
+                    total_cleared += 1
+            
+            # 2. Clean up face tracker
+            tracker_before = len(self.face_tracker)
+            to_remove = []
+            for face_id, (_, _, timestamp) in self.face_tracker.items():
+                if (current_time - timestamp) > 30.0:
+                    to_remove.append(face_id)
+            
+            for face_id in to_remove:
+                self.face_tracker.pop(face_id, None)
+            
+            # 3. Clean up global positions
+            to_remove = []
+            for face_id, (_, _, _, timestamp) in self.global_face_positions.items():
+                if (current_time - timestamp) > 30.0:
+                    to_remove.append(face_id)
+            
+            for face_id in to_remove:
+                self.global_face_positions.pop(face_id, None)
+            
+            # 4. Force unknown person manager cleanup
+            self.unknown_person_manager.cleanup_old_first_seen()
+            
+            # 5. Clear recognition cache
+            self.recognition_cache.clear()
+            
+            # 6. Force garbage collection
+            import gc
+            gc.collect()
+            
+            logger.info(f"🧹 Cleanup complete: {total_cleared} cache entries, {tracker_before - len(self.face_tracker)} trackers cleared")
+            
+        except Exception as e:
+            logger.error(f"Error in aggressive cleanup: {e}")
 
     def _create_detection_result(self, frame_data: FrameData, face_detections: list, start_time: float) -> DetectionResult:
         """Create DetectionResult object"""
@@ -1047,18 +1169,60 @@ class FaceDetectionProcessor:
             except Exception as e:
                 if self.log_counter % 100 == 0:
                     logger.error(f"Error in detection callback: {e}")
-    
-# Make sure this import is at the top of the file or in the draw_detections method:
-    from .emotion_recognizer import normalize_emotion
-
-    # In the draw_detections method, ensure emotion display works:
-# Fix the draw_detections method - the logic for showing emotions on recognized faces is broken:
-
+  
     def draw_detections(self, frame: np.ndarray, detections: List[FaceDetection], 
                     show_emotions: bool = True, show_probabilities: bool = False) -> np.ndarray:
         """Draw detection results on frame with names and enhanced visualization"""
         annotated_frame = frame.copy()
+        h, w = frame.shape[:2]
 
+        # ADD ROI RECTANGLE (this will show in WebSocket now!)
+        margin_x = w * (1 - self.roi_percentage) / 2
+        margin_y = h * (1 - self.roi_percentage) / 2
+        
+        roi_left = int(margin_x)
+        roi_top = int(margin_y) 
+        roi_right = int(w - margin_x)
+        roi_bottom = int(h - margin_y)
+        
+        # Draw ROI rectangle (green, 2px thick)
+        cv2.rectangle(annotated_frame, (roi_left, roi_top), (roi_right, roi_bottom), 
+                    (0, 255, 0), 2)
+        
+        # Add ROI label
+        roi_label = f"Detection Area: {int(self.roi_percentage * 100)}%"
+        label_size = cv2.getTextSize(roi_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+        
+        # Draw label background
+        cv2.rectangle(annotated_frame, 
+                    (roi_left, roi_top - 20), 
+                    (roi_left + label_size[0] + 8, roi_top - 2), 
+                    (0, 255, 0), -1)
+        
+        # Draw label text
+        cv2.putText(annotated_frame, roi_label, (roi_left + 4, roi_top - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+        # EXISTING face detection drawing code continues here...
+        for detection in detections:
+            # Draw bounding box with color based on recognition status
+            if detection.is_recognized:
+                color = (0, 255, 0)  # Green for recognized faces
+                thickness = 3
+            else:
+                color = self._get_emotion_color(detection.emotion)
+                thickness = 2
+            
+            # Draw main bounding box
+            cv2.rectangle(
+                annotated_frame,
+                (detection.x, detection.y),
+                (detection.x + detection.width, detection.y + detection.height),
+                color,
+                thickness
+            )
+
+        # EXISTING CODE: Draw face detections (unchanged)
         for detection in detections:
             # Draw bounding box with color based on recognition status
             if detection.is_recognized:
@@ -1090,108 +1254,56 @@ class FaceDetectionProcessor:
                 if detection.face_id:
                     name_parts.append(f"Unknown #{detection.face_id.split('_')[-1]}")
             
-            # Build emotion label (separate from name)
+            # Build emotion label  
             if show_emotions and detection.emotion:
-                try:
-                    # Try to import normalize_emotion, fallback if not available
-                    try:
-                        from .emotion_recognizer import normalize_emotion
-                        emotion_text = f"{normalize_emotion(detection.emotion).title()}"
-                    except ImportError:
-                        emotion_text = f"{detection.emotion.title()}"
-                    
-                    if detection.emotion_confidence:
-                        emotion_text += f" {detection.emotion_confidence:.0%}"
-                    emotion_parts.append(emotion_text)
-                except Exception as e:
-                    # Fallback emotion display
-                    emotion_text = f"{detection.emotion}"
-                    if detection.emotion_confidence:
-                        emotion_text += f" {detection.emotion_confidence:.0%}"
-                    emotion_parts.append(emotion_text)
+                emotion_parts.append(f"{detection.emotion}")
+                if detection.emotion_confidence > 0:
+                    emotion_parts.append(f"({detection.emotion_confidence:.2f})")
             
-            # Draw labels
-            if name_parts or emotion_parts:
-                if detection.is_recognized:
-                    # For recognized faces: name on top, emotion below
-                    if name_parts:
-                        name_label = " ".join(name_parts)
-                        
-                        # Draw name label
-                        font_scale = 0.8
-                        font_thickness = 2
-                        label_size = cv2.getTextSize(name_label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)[0]
-                        
-                        # Draw name background
-                        cv2.rectangle(
-                            annotated_frame,
-                            (detection.x, detection.y - label_size[1] - 20),
+            # Draw name label if we have one
+            if name_parts:
+                name_label = " ".join(name_parts)
+                label_size = cv2.getTextSize(name_label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                
+                # Draw name background
+                cv2.rectangle(annotated_frame, 
+                            (detection.x, detection.y - label_size[1] - 15),
                             (detection.x + label_size[0] + 10, detection.y - 5),
-                            color,
-                            -1
-                        )
-                        
-                        # Draw name text
-                        cv2.putText(
-                            annotated_frame,
-                            name_label,
-                            (detection.x + 5, detection.y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            font_scale,
-                            (255, 255, 255),
-                            font_thickness
-                        )
-                    
-                    # Draw emotion label below the face (FIXED: Always show emotion if available)
-                    if emotion_parts:
-                        emotion_label = " ".join(emotion_parts)
-                        emotion_size = cv2.getTextSize(emotion_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
-                        
-                        cv2.rectangle(
-                            annotated_frame,
-                            (detection.x, detection.y + detection.height + 5),
-                            (detection.x + emotion_size[0] + 10, detection.y + detection.height + 25),
-                            self._get_emotion_color(detection.emotion),
-                            -1
-                        )
-                        
-                        cv2.putText(
-                            annotated_frame,
-                            emotion_label,
-                            (detection.x + 5, detection.y + detection.height + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (255, 255, 255),
-                            1
-                        )
-                else:
-                    # For unknown faces: show all info in one label
-                    all_parts = name_parts + emotion_parts
-                    main_label = " | ".join(all_parts)
-                    label_size = cv2.getTextSize(main_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                    
-                    # Draw label background
-                    cv2.rectangle(
-                        annotated_frame,
-                        (detection.x, detection.y - label_size[1] - 15),
-                        (detection.x + label_size[0] + 10, detection.y - 5),
-                        color,
-                        -1
-                    )
-                    
-                    # Draw main label text
-                    cv2.putText(
-                        annotated_frame,
-                        main_label,
+                            color, -1)
+                
+                # Draw name text
+                cv2.putText(annotated_frame, name_label, 
                         (detection.x + 5, detection.y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2
-                    )
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Draw emotion label if we have one
+            if emotion_parts:
+                emotion_label = " ".join(emotion_parts)
+                emotion_color = self._get_emotion_color(detection.emotion)
+                
+                # Position below name or above face if no name
+                y_pos = detection.y + detection.height + 25 if name_parts else detection.y - 10
+                
+                label_size = cv2.getTextSize(emotion_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+                
+                # Draw emotion background
+                cv2.rectangle(annotated_frame,
+                            (detection.x, y_pos - label_size[1] - 5),
+                            (detection.x + label_size[0] + 10, y_pos + 5),
+                            emotion_color, -1)
+                
+                # Draw emotion text
+                cv2.putText(annotated_frame, emotion_label,
+                        (detection.x + 5, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+            # Draw emotion probabilities if enabled
+            if show_probabilities and detection.emotion_probabilities:
+                self._draw_emotion_probabilities(annotated_frame, detection.emotion_probabilities, 
+                                            detection.x, detection.y + detection.height)
         
         return annotated_frame
-    
+
     def _get_emotion_color(self, emotion: str) -> tuple:
         """Get color for emotion visualization"""
         colors = {
@@ -2011,3 +2123,10 @@ class FaceDetectionProcessor:
         else:
             return str(obj)
 
+    def _monitor_cache_sizes(self):
+        """Monitor and log cache sizes"""
+        if self.frame_counter % 1000 == 0:  # Every ~30 seconds
+            total_cache_size = sum(len(cache) for cache in self.face_cache.values())
+            logger.info(f"📊 Cache sizes: face_cache={total_cache_size}, "
+                    f"face_tracker={len(self.face_tracker)}, "
+                    f"global_positions={len(self.global_face_positions)}")

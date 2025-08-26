@@ -566,8 +566,14 @@ class CentralizedDisplayManager:
             try:
                 detections = self.face_detector.get_stream_detections(frame_data.stream_id)
                 if detections and detections.faces:
-                    # Draw face annotations directly on frame
-                    frame = self._draw_face_annotations_directly(frame, detections.faces)
+                    # CHANGE: Use the main draw_detections method instead of custom drawing
+                    # This will include the ROI rectangle!
+                    frame = self.face_detector.draw_detections(
+                        frame, 
+                        detections.faces,
+                        show_emotions=True,
+                        show_probabilities=False
+                    )
             except Exception as e:
                 logger.debug(f"Error drawing detections for WebSocket: {e}")
         
@@ -586,70 +592,70 @@ class CentralizedDisplayManager:
         
         return frame
     
-    def _draw_face_annotations_directly(self, frame, faces):
-        """Draw face annotations directly on frame with proper names and emotions"""
-        from .emotion_recognizer import normalize_emotion
+    # def _draw_face_annotations_directly(self, frame, faces):
+    #     """Draw face annotations directly on frame with proper names and emotions"""
+    #     from .emotion_recognizer import normalize_emotion
         
-        for face in faces:
-            x, y, w, h = int(face.x), int(face.y), int(face.width), int(face.height)
+    #     for face in faces:
+    #         x, y, w, h = int(face.x), int(face.y), int(face.width), int(face.height)
             
-            # Choose color and thickness based on recognition status
-            if face.is_recognized:
-                color = (0, 255, 0)  # Green for recognized faces
-                thickness = 3
-            else:
-                color = self._get_emotion_color_simple(face.emotion)
-                thickness = 2
+    #         # Choose color and thickness based on recognition status
+    #         if face.is_recognized:
+    #             color = (0, 255, 0)  # Green for recognized faces
+    #             thickness = 3
+    #         else:
+    #             color = self._get_emotion_color_simple(face.emotion)
+    #             thickness = 2
             
-            # Draw bounding box
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
+    #         # Draw bounding box
+    #         cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
             
-            # Prepare labels (same logic as draw_detections)
-            name_parts = []
-            emotion_parts = []
+    #         # Prepare labels (same logic as draw_detections)
+    #         name_parts = []
+    #         emotion_parts = []
             
-            # Build name label
-            if face.is_recognized and face.human_name:
-                name_parts.append(f"{face.human_name}")
-                if face.recognition_confidence and face.recognition_confidence > 0:
-                    name_parts.append(f"({face.recognition_confidence:.1%})")
-            else:
-                if face.face_id:
-                    name_parts.append(f"Unknown #{face.face_id.split('_')[-1]}")
+    #         # Build name label
+    #         if face.is_recognized and face.human_name:
+    #             name_parts.append(f"{face.human_name}")
+    #             if face.recognition_confidence and face.recognition_confidence > 0:
+    #                 name_parts.append(f"({face.recognition_confidence:.1%})")
+    #         else:
+    #             if face.face_id:
+    #                 name_parts.append(f"Unknown #{face.face_id.split('_')[-1]}")
             
-            # Build emotion label with normalize_emotion
-            if face.emotion:
-                try:
-                    emotion_text = f"{normalize_emotion(face.emotion).title()}"
-                    if face.emotion_confidence and face.emotion_confidence > 0:
-                        emotion_text += f" {face.emotion_confidence:.0%}"
-                    emotion_parts.append(emotion_text)
-                except Exception:
-                    # Fallback if normalize_emotion is not available
-                    emotion_text = f"{face.emotion.title()}"
-                    if face.emotion_confidence and face.emotion_confidence > 0:
-                        emotion_text += f" {face.emotion_confidence:.0%}"
-                    emotion_parts.append(emotion_text)
+    #         # Build emotion label with normalize_emotion
+    #         if face.emotion:
+    #             try:
+    #                 emotion_text = f"{normalize_emotion(face.emotion).title()}"
+    #                 if face.emotion_confidence and face.emotion_confidence > 0:
+    #                     emotion_text += f" {face.emotion_confidence:.0%}"
+    #                 emotion_parts.append(emotion_text)
+    #             except Exception:
+    #                 # Fallback if normalize_emotion is not available
+    #                 emotion_text = f"{face.emotion.title()}"
+    #                 if face.emotion_confidence and face.emotion_confidence > 0:
+    #                     emotion_text += f" {face.emotion_confidence:.0%}"
+    #                 emotion_parts.append(emotion_text)
             
-            # Draw labels
-            if name_parts or emotion_parts:
-                if face.is_recognized:
-                    # For recognized faces: name on top, emotion below
-                    if name_parts:
-                        name_label = " ".join(name_parts)
-                        self._draw_websocket_label(frame, name_label, (x, y - 10), color, 0.8, 2)
+    #         # Draw labels
+    #         if name_parts or emotion_parts:
+    #             if face.is_recognized:
+    #                 # For recognized faces: name on top, emotion below
+    #                 if name_parts:
+    #                     name_label = " ".join(name_parts)
+    #                     self._draw_websocket_label(frame, name_label, (x, y - 10), color, 0.8, 2)
                     
-                    if emotion_parts:
-                        emotion_label = " ".join(emotion_parts)
-                        emotion_color = self._get_emotion_color_simple(face.emotion)
-                        self._draw_websocket_label(frame, emotion_label, (x, y + h + 25), emotion_color, 0.6, 1)
-                else:
-                    # For unknown faces: show all info in one label
-                    all_parts = name_parts + emotion_parts
-                    main_label = " | ".join(all_parts)
-                    self._draw_websocket_label(frame, main_label, (x, y - 10), color, 0.6, 2)
+    #                 if emotion_parts:
+    #                     emotion_label = " ".join(emotion_parts)
+    #                     emotion_color = self._get_emotion_color_simple(face.emotion)
+    #                     self._draw_websocket_label(frame, emotion_label, (x, y + h + 25), emotion_color, 0.6, 1)
+    #             else:
+    #                 # For unknown faces: show all info in one label
+    #                 all_parts = name_parts + emotion_parts
+    #                 main_label = " | ".join(all_parts)
+    #                 self._draw_websocket_label(frame, main_label, (x, y - 10), color, 0.6, 2)
         
-        return frame
+    #     return frame
 
     def _draw_websocket_label(self, frame, text, position, color, font_scale, thickness):
         """Helper method to draw text with background for WebSocket"""
