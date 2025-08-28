@@ -36,13 +36,13 @@ if __name__ == "__main__":
         logger.error(f"Fatal error: {e}")
         sys.exit(1)
         
-import time
+# import time
 
-def some_func():
-    time.sleep(3600)
+# def some_func():
+#     time.sleep(3600)
         
-for i in range(1, 11):
-    thread = threading.Thread(target=some_func)
+# for i in range(1, 11):
+#     thread = threading.Thread(target=some_func)
 
 # from ucode_sdk import sdk
 # ucodeApi = sdk.new(config=sdk.Config(app_id="P-QlWnuJCdfy32dsQoIjXHQNScO7DR2TdL",base_url="https://api.admin.u-code.io"))
