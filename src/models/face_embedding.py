@@ -38,6 +38,8 @@ class SearchResult:
     distance: float = None
     recognition_confidence: float = None
     human_type: str = None
+    company_id: str = None
+    branch_id: str = None
     
     @classmethod
     def from_face_embedding(cls, face_embedding: FaceEmbedding, 

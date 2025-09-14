@@ -65,6 +65,7 @@ class EmotionTracker:
     def get_average_confidence(self) -> float:
         """Calculate average confidence over the emotion duration"""
         if not self.confidence_readings:
+            logger.info("Falling back to old confidence")
             return safe_float(self.confidence)  # Fallback to old confidence
         
         # Calculate weighted average - more recent readings have slightly more weight
@@ -580,7 +581,7 @@ class SimpleEmotionProcessor:
             # Publish using new publisher (handles RabbitMQ + REST fallback automatically)
             success = self.emotion_publisher.publish_emotion(emotion_data)
             
-            if success:
+            if success: 
                 # Mark as sent
                 emotion.sent_to_api = True
                 

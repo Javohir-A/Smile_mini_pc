@@ -1,7 +1,7 @@
 import asyncio
 import sys
 import logging
-from src.app.camera_streaming_app import main
+from src.app.app import main
 
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)

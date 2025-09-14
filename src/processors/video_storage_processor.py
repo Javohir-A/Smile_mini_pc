@@ -263,7 +263,8 @@ class AsyncVideoStorageProcessor:
         self.cleanup_counter += 1
         if self.cleanup_counter % 1000 == 0:
             try:
-                self._aggressive_memory_cleanup()
+                # self._aggressive_memory_cleanup()
+                pass
             except Exception as e:
                 logger.error(f"❌ Video cleanup failed: {e}")
         with self.lock:

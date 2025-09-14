@@ -17,6 +17,7 @@ from src.config import AppConfig
 from src.di.dependencies import DependencyContainer
 from src.models.stream import FrameData
 from src.models.detection import * #import everything in this modul FaceDtection, DetectionResult
+from src.models.mini_pc import * #import everything in this modul FaceDtection, DetectionResult
 from .unknown_face_processor import UnknownPersonManager
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,8 @@ class FaceDetectionProcessor:
         self.next_face_id = 1
         self._lock = threading.Lock()
         self.min_face_size: Optional[int] = 150
+        
+        self.mini_pc_info:MiniPC = None
         
         self.memory_cleanup_counter = 0
         self.aggressive_cleanup_interval = 100
@@ -178,62 +181,84 @@ class FaceDetectionProcessor:
         else:
             return self.ConservativeRecognitionSettings.NORMAL_THRESHOLD
 
+    # def _validate_face_match(self, best_match, all_results, face_id: str) -> bool:
+    #     """FIXED: Multi-layer validation that handles excellent matches properly"""
+        
+    #     logger.debug(f"🔍 Validating match for {face_id}: {best_match.name} (L2: {best_match.distance:.3f})")
+        
+    #     # VALIDATION 1: Distance threshold - but different thresholds for different quality
+    #     if best_match.distance <= 0.15:
+    #         # EXCELLENT MATCH: Very close, almost certainly correct
+    #         logger.debug(f"✅ EXCELLENT MATCH: Distance {best_match.distance:.3f} - skipping other validations")
+    #         return True
+    #     elif best_match.distance > 1.8:
+    #         # TOO FAR: Definitely reject
+    #         logger.debug(f"❌ Validation failed: Distance {best_match.distance:.3f} > 1.8 (too far)")
+    #         return False
+        
+    #     # VALIDATION 2: For good matches (0.15 < distance <= 1.8), check confidence gap
+    #     if len(all_results) > 1:
+    #         second_match = all_results[1]
+    #         confidence_gap = second_match.distance - best_match.distance
+            
+    #         # ADAPTIVE GAP REQUIREMENT: Better matches need smaller gaps
+    #         if best_match.distance <= 0.5:
+    #             min_gap = 0.1  # Very good matches only need small gap
+    #         elif best_match.distance <= 1.0:
+    #             min_gap = 0.2  # Good matches need moderate gap
+    #         else:
+    #             min_gap = 0.3  # Average matches need large gap
+            
+    #         if confidence_gap < min_gap:
+    #             logger.debug(f"❌ Validation failed: Confidence gap {confidence_gap:.3f} < {min_gap:.3f}")
+    #             logger.debug(f"  Best: {best_match.name} ({best_match.distance:.3f})")
+    #             logger.debug(f"  Second: {second_match.name} ({second_match.distance:.3f})")
+    #             return False
+    #         else:
+    #             logger.debug(f"✅ Confidence gap OK: {confidence_gap:.3f} >= {min_gap:.3f}")
+        
+    #     # VALIDATION 3: Minimum recognition confidence
+    #     recognition_conf = self._calculate_recognition_confidence(best_match.distance)
+    #     min_confidence = 0.60  # LOWERED: Was 0.65, now 0.60
+        
+    #     if recognition_conf < min_confidence:
+    #         logger.debug(f"❌ Validation failed: Recognition confidence {recognition_conf:.3f} < {min_confidence}")
+    #         return False
+        
+    #     # VALIDATION 4: Distance ratio check (only for marginal matches)
+    #     if best_match.distance > 0.5 and len(all_results) > 1:
+    #         second_match = all_results[1]
+    #         distance_ratio = best_match.distance / second_match.distance
+    #         max_ratio = 0.80  # RELAXED: Was 0.75, now 0.80
+            
+    #         if distance_ratio > max_ratio:
+    #             logger.debug(f"❌ Validation failed: Distance ratio {distance_ratio:.3f} > {max_ratio}")
+    #             return False
+        
+    #     logger.debug(f"✅ All validations passed for {best_match.name}")
+    #     return True
+
     def _validate_face_match(self, best_match, all_results, face_id: str) -> bool:
-        """FIXED: Multi-layer validation that handles excellent matches properly"""
+        """Optimized validation for large-scale recognition"""
+        d = best_match.distance
         
-        logger.debug(f"🔍 Validating match for {face_id}: {best_match.name} (L2: {best_match.distance:.3f})")
-        
-        # VALIDATION 1: Distance threshold - but different thresholds for different quality
-        if best_match.distance <= 0.15:
-            # EXCELLENT MATCH: Very close, almost certainly correct
-            logger.debug(f"✅ EXCELLENT MATCH: Distance {best_match.distance:.3f} - skipping other validations")
+        # 1. Absolute distance check (primary gate)
+        if d <= 0.30:  # strong match
             return True
-        elif best_match.distance > 1.8:
-            # TOO FAR: Definitely reject
-            logger.debug(f"❌ Validation failed: Distance {best_match.distance:.3f} > 1.8 (too far)")
+        elif d > 1.2:  # too far to be realistic
             return False
-        
-        # VALIDATION 2: For good matches (0.15 < distance <= 1.8), check confidence gap
-        if len(all_results) > 1:
-            second_match = all_results[1]
-            confidence_gap = second_match.distance - best_match.distance
-            
-            # ADAPTIVE GAP REQUIREMENT: Better matches need smaller gaps
-            if best_match.distance <= 0.5:
-                min_gap = 0.1  # Very good matches only need small gap
-            elif best_match.distance <= 1.0:
-                min_gap = 0.2  # Good matches need moderate gap
-            else:
-                min_gap = 0.3  # Average matches need large gap
-            
-            if confidence_gap < min_gap:
-                logger.debug(f"❌ Validation failed: Confidence gap {confidence_gap:.3f} < {min_gap:.3f}")
-                logger.debug(f"  Best: {best_match.name} ({best_match.distance:.3f})")
-                logger.debug(f"  Second: {second_match.name} ({second_match.distance:.3f})")
+
+        # 2. Optional gap check (only if distance is borderline)
+        if 0.30 < d <= 0.50 and len(all_results) > 1:
+            second = all_results[1]
+            confidence_gap = second.distance - d
+            if confidence_gap < 0.05:  # smaller, scale-friendly
                 return False
-            else:
-                logger.debug(f"✅ Confidence gap OK: {confidence_gap:.3f} >= {min_gap:.3f}")
-        
-        # VALIDATION 3: Minimum recognition confidence
-        recognition_conf = self._calculate_recognition_confidence(best_match.distance)
-        min_confidence = 0.60  # LOWERED: Was 0.65, now 0.60
-        
-        if recognition_conf < min_confidence:
-            logger.debug(f"❌ Validation failed: Recognition confidence {recognition_conf:.3f} < {min_confidence}")
-            return False
-        
-        # VALIDATION 4: Distance ratio check (only for marginal matches)
-        if best_match.distance > 0.5 and len(all_results) > 1:
-            second_match = all_results[1]
-            distance_ratio = best_match.distance / second_match.distance
-            max_ratio = 0.80  # RELAXED: Was 0.75, now 0.80
-            
-            if distance_ratio > max_ratio:
-                logger.debug(f"❌ Validation failed: Distance ratio {distance_ratio:.3f} > {max_ratio}")
-                return False
-        
-        logger.debug(f"✅ All validations passed for {best_match.name}")
-        return True
+
+        # 3. Confidence check (derived from distance)
+        recognition_conf = self._calculate_recognition_confidence(d)
+        return recognition_conf >= 0.55
+
 
     def _calculate_recognition_confidence(self, l2_distance: float) -> float:
         """Calculate recognition confidence from L2 distance"""
@@ -596,6 +621,12 @@ class FaceDetectionProcessor:
             face_embedding, limit=5, threshold=2.0
         )
         
+        company_id = self.mini_pc_info.company_id
+        best_match = search_results[0]
+        # search_results[:3]
+        if not(best_match.company_id == company_id):
+            logger.info(f"🔍 Company id didn't match: Face {face_id} - processing as unknown")
+        
         if not search_results:
             logger.info(f"🔍 NO MATCHES: Face {face_id} - processing as unknown")
             return
@@ -606,7 +637,7 @@ class FaceDetectionProcessor:
             confidence = self._calculate_recognition_confidence(match.distance)
             logger.info(f"  {i+1}. {match.name} - L2: {match.distance:.3f}, conf: {confidence:.3f}")
         
-        best_match = search_results[0]
+
         is_valid_match = self._validate_face_match(best_match, search_results, face_id)
         
         if is_valid_match:
@@ -626,6 +657,7 @@ class FaceDetectionProcessor:
                 if face_id in self.unknown_person_manager.unknown_faces_buffer:
                     self.unknown_person_manager.cleanup_face(face_id)
                 self.unknown_person_manager.saved_faces.add(face_id)
+            
         else:
             logger.info(f"❌ REJECTED MATCH: Face {face_id} -> '{best_match.name}' "
                     f"(L2: {best_match.distance:.3f}) - failed validation")
@@ -771,7 +803,8 @@ class FaceDetectionProcessor:
         """Process a single frame with full face ROI constraint"""
         self.memory_cleanup_counter += 1
         if self.memory_cleanup_counter % self.aggressive_cleanup_interval == 0:
-            self._aggressive_memory_cleanup()
+            # self._aggressive_memory_cleanup()
+            pass
         
         if not self.net:
             return None

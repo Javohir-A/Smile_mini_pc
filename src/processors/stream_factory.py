@@ -85,7 +85,7 @@ class StreamProcessorFactory:
             
             # Create the face detector
             face_detector = FaceDetectionProcessor(config, container)
-            
+            face_detector.mini_pc_info = container.mini_pc_info
             # Validate that all components are properly initialized
             stats = face_detector.get_detection_stats()
             logger.info(f"Face detection initialization status: {stats}")

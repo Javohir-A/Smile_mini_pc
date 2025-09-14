@@ -100,7 +100,7 @@ class DependencyContainer:
         self.config = config
         self.db_manager = DatabaseManager(config)
         self._mini_pc_usecase: MiniPCUseCase = None
-        
+        self.mini_pc_info = None
         # Initialize face repository and usecase as instance variables
         self._face_repository: FaceRepository = None
         self._face_usecase: FaceUseCase = None
