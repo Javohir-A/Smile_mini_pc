@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera Management - Smile Mini PC</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #2c3e50 0%, #3498db 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #3498db, #2980b9);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.4);
+        }
+        
+        .btn-success {
+            background: linear-gradient(135deg, #27ae60, #229954);
+            color: white;
+        }
+        
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(39, 174, 96, 0.4);
+        }
+        
+        .btn-danger {
+            background: linear-gradient(135deg, #e74c3c, #c0392b);
+            color: white;
+        }
+        
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(231, 76, 60, 0.4);
+        }
+        
+        .btn-warning {
+            background: linear-gradient(135deg, #f39c12, #e67e22);
+            color: white;
+        }
+        
+        .btn-warning:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(243, 156, 18, 0.4);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none !important;
+            box-shadow: none !important;
+        }
+        
+        .status-bar {
+            background: #ecf0f1;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #95a5a6;
+        }
+        
+        .status-indicator.online {
+            background: #27ae60;
+            animation: pulse 2s infinite;
+        }
+        
+        .status-indicator.offline {
+            background: #e74c3c;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .cameras-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .camera-card {
+            background: white;
+            border: 2px solid #ecf0f1;
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+        
+        .camera-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+            border-color: #3498db;
+        }
+        
+        .camera-card.streaming {
+            border-color: #27ae60;
+            background: linear-gradient(135deg, #d5f4e6, #ffffff);
+        }
+        
+        .camera-card.error {
+            border-color: #e74c3c;
+            background: linear-gradient(135deg, #fdf2f2, #ffffff);
+        }
+        
+        .camera-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .camera-name {
+            font-size: 1.2em;
+            font-weight: 600;
+            color: #2c3e50;
+        }
+        
+        .camera-status {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .status-available {
+            background: #d5f4e6;
+            color: #27ae60;
+        }
+        
+        .status-streaming {
+            background: #d5f4e6;
+            color: #27ae60;
+        }
+        
+        .status-error {
+            background: #fdf2f2;
+            color: #e74c3c;
+        }
+        
+        .camera-info {
+            margin-bottom: 15px;
+        }
+        
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 0.9em;
+        }
+        
+        .info-label {
+            color: #7f8c8d;
+            font-weight: 500;
+        }
+        
+        .info-value {
+            color: #2c3e50;
+            font-weight: 600;
+        }
+        
+        .camera-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        .btn-small {
+            padding: 8px 16px;
+            font-size: 12px;
+            border-radius: 6px;
+        }
+        
+        .rtsp-url {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 8px;
+            font-family: monospace;
+            font-size: 0.8em;
+            margin-top: 10px;
+            word-break: break-all;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid;
+        }
+        
+        .alert-success {
+            background: #d5f4e6;
+            color: #27ae60;
+            border-left-color: #27ae60;
+        }
+        
+        .alert-error {
+            background: #fdf2f2;
+            color: #e74c3c;
+            border-left-color: #e74c3c;
+        }
+        
+        .alert-info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border-left-color: #17a2b8;
+        }
+        
+        .no-cameras {
+            text-align: center;
+            padding: 60px 20px;
+            color: #7f8c8d;
+        }
+        
+        .no-cameras h3 {
+            margin-bottom: 15px;
+            color: #2c3e50;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                margin: 10px;
+                border-radius: 10px;
+            }
+            
+            .header {
+                padding: 20px;
+            }
+            
+            .header h1 {
+                font-size: 2em;
+            }
+            
+            .content {
+                padding: 20px;
+            }
+            
+            .controls {
+                flex-direction: column;
+            }
+            
+            .cameras-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .status-bar {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎥 Camera Management</h1>
+            <p>Detect and manage local web cameras on your Mini PC</p>
+        </div>
+        
+        <div class="content">
+            <div class="controls">
+                <button class="btn btn-primary" onclick="detectCameras()">
+                    🔍 Detect Cameras
+                </button>
+                <button class="btn btn-warning" onclick="startMediaMTX()">
+                    🚀 Start MediaMTX
+                </button>
+                <button class="btn btn-danger" onclick="stopAllStreams()">
+                    ⏹️ Stop All Streams
+                </button>
+                <button class="btn btn-success" onclick="refreshStatus()">
+                    🔄 Refresh Status
+                </button>
+            </div>
+            
+            <div class="status-bar">
+                <div class="status-item">
+                    <div class="status-indicator" id="mediamtx-status"></div>
+                    <span>MediaMTX Server</span>
+                </div>
+                <div class="status-item">
+                    <span id="cameras-count">0 cameras detected</span>
+                </div>
+                <div class="status-item">
+                    <span id="streams-count">0 streams active</span>
+                </div>
+            </div>
+            
+            <div id="alerts-container"></div>
+            
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>Loading...</p>
+            </div>
+            
+            <div id="cameras-container">
+                <div class="no-cameras">
+                    <h3>No cameras detected</h3>
+                    <p>Click "Detect Cameras" to scan for available web cameras</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        let cameras = [];
+        
+        // Utility functions
+        function showAlert(message, type = 'info') {
+            const container = document.getElementById('alerts-container');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.innerHTML = message;
+            container.appendChild(alert);
+            
+            setTimeout(() => {
+                alert.remove();
+            }, 5000);
+        }
+        
+        function showLoading(show = true) {
+            document.getElementById('loading').style.display = show ? 'block' : 'none';
+        }
+        
+        // API functions
+        async function fetchCameras() {
+            try {
+                const response = await fetch(`${API_BASE}/api/cameras/`);
+                if (!response.ok) throw new Error('Failed to fetch cameras');
+                return await response.json();
+            } catch (error) {
+                console.error('Error fetching cameras:', error);
+                showAlert('Failed to fetch cameras: ' + error.message, 'error');
+                return [];
+            }
+        }
+        
+        async function detectCameras() {
+            showLoading(true);
+            try {
+                const response = await fetch(`${API_BASE}/api/cameras/detect`, {
+                    method: 'POST'
+                });
+                if (!response.ok) throw new Error('Failed to detect cameras');
+                
+                const result = await response.json();
+                cameras = result;
+                renderCameras();
+                updateStatus();
+                showAlert(`Detected ${result.length} cameras`, 'success');
+            } catch (error) {
+                console.error('Error detecting cameras:', error);
+                showAlert('Failed to detect cameras: ' + error.message, 'error');
+            } finally {
+                showLoading(false);
+            }
+        }
+        
+        async function startMediaMTX() {
+            try {
+                const response = await fetch(`${API_BASE}/api/cameras/status/mediamtx/start`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                
+                if (result.success) {
+                    showAlert('MediaMTX started successfully', 'success');
+                    updateMediaMTXStatus();
+                } else {
+                    showAlert('Failed to start MediaMTX: ' + result.message, 'error');
+                }
+            } catch (error) {
+                console.error('Error starting MediaMTX:', error);
+                showAlert('Failed to start MediaMTX: ' + error.message, 'error');
+            }
+        }
+        
+        async function stopAllStreams() {
+            try {
+                const response = await fetch(`${API_BASE}/api/cameras/stop-all`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                
+                if (result.success) {
+                    showAlert('All streams stopped', 'success');
+                    cameras = await fetchCameras();
+                    renderCameras();
+                    updateStatus();
+                } else {
+                    showAlert('Failed to stop streams: ' + result.message, 'error');
+                }
+            } catch (error) {
+                console.error('Error stopping streams:', error);
+                showAlert('Failed to stop streams: ' + error.message, 'error');
+            }
+        }
+        
+        async function startStream(devicePath, streamName = null) {
+            try {
+                const response = await fetch(`${API_BASE}/api/cameras/by-path/${encodeURIComponent(devicePath)}/stream`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        device_path: devicePath,
+                        stream_name: streamName
+                    })
+                });
+                const result = await response.json();
+                
+                if (result.success) {
+                    showAlert(`Stream started: ${result.stream_name}`, 'success');
+                    cameras = await fetchCameras();
+                    renderCameras();
+                    updateStatus();
+                } else {
+                    showAlert('Failed to start stream: ' + result.message, 'error');
+                }
+            } catch (error) {
+                console.error('Error starting stream:', error);
+                showAlert('Failed to start stream: ' + error.message, 'error');
+            }
+        }
+        
+        async function stopStream(devicePath) {
+            try {
+                const response = await fetch(`${API_BASE}/api/cameras/by-path/${encodeURIComponent(devicePath)}/stop`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                
+                if (result.success) {
+                    showAlert('Stream stopped', 'success');
+                    cameras = await fetchCameras();
+                    renderCameras();
+                    updateStatus();
+                } else {
+                    showAlert('Failed to stop stream: ' + result.message, 'error');
+                }
+            } catch (error) {
+                console.error('Error stopping stream:', error);
+                showAlert('Failed to stop stream: ' + error.message, 'error');
+            }
+        }
+        
+        async function getMediaMTXStatus() {
+            try {
+                const response = await fetch(`${API_BASE}/api/cameras/status/mediamtx`);
+                const result = await response.json();
+                return result;
+            } catch (error) {
+                console.error('Error getting MediaMTX status:', error);
+                return { running: false };
+            }
+        }
+        
+        // UI functions
+        function renderCameras() {
+            const container = document.getElementById('cameras-container');
+            
+            if (cameras.length === 0) {
+                container.innerHTML = `
+                    <div class="no-cameras">
+                        <h3>No cameras detected</h3>
+                        <p>Click "Detect Cameras" to scan for available web cameras</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            container.innerHTML = cameras.map(camera => `
+                <div class="camera-card ${camera.is_streaming ? 'streaming' : ''} ${camera.status === 'error' ? 'error' : ''}">
+                    <div class="camera-header">
+                        <div class="camera-name">${camera.name}</div>
+                        <div class="camera-status status-${camera.status}">${camera.status}</div>
+                    </div>
+                    
+                    <div class="camera-info">
+                        <div class="info-row">
+                            <span class="info-label">Device:</span>
+                            <span class="info-value">${camera.device_path}</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Resolution:</span>
+                            <span class="info-value">${camera.resolution[0]}x${camera.resolution[1]}</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Formats:</span>
+                            <span class="info-value">${camera.supported_formats.join(', ')}</span>
+                        </div>
+                        ${camera.is_streaming && camera.rtsp_url ? `
+                            <div class="rtsp-url">
+                                <strong>RTSP URL:</strong><br>
+                                ${camera.rtsp_url}
+                            </div>
+                        ` : ''}
+                    </div>
+                    
+                    <div class="camera-actions">
+                        ${camera.is_streaming ? `
+                            <button class="btn btn-danger btn-small" onclick="stopStream('${camera.device_path}')">
+                                ⏹️ Stop Stream
+                            </button>
+                        ` : `
+                            <button class="btn btn-success btn-small" onclick="startStream('${camera.device_path}')">
+                                ▶️ Start Stream
+                            </button>
+                        `}
+                        <button class="btn btn-primary btn-small" onclick="copyRTSPUrl('${camera.rtsp_url || ''}')" ${!camera.rtsp_url ? 'disabled' : ''}>
+                            📋 Copy RTSP URL
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        function updateStatus() {
+            const camerasCount = cameras.length;
+            const streamsCount = cameras.filter(cam => cam.is_streaming).length;
+            
+            document.getElementById('cameras-count').textContent = `${camerasCount} cameras detected`;
+            document.getElementById('streams-count').textContent = `${streamsCount} streams active`;
+        }
+        
+        async function updateMediaMTXStatus() {
+            const status = await getMediaMTXStatus();
+            const indicator = document.getElementById('mediamtx-status');
+            
+            if (status.running) {
+                indicator.className = 'status-indicator online';
+            } else {
+                indicator.className = 'status-indicator offline';
+            }
+        }
+        
+        function copyRTSPUrl(url) {
+            if (!url) return;
+            
+            navigator.clipboard.writeText(url).then(() => {
+                showAlert('RTSP URL copied to clipboard!', 'success');
+            }).catch(() => {
+                // Fallback for older browsers
+                const textArea = document.createElement('textarea');
+                textArea.value = url;
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+                showAlert('RTSP URL copied to clipboard!', 'success');
+            });
+        }
+        
+        async function refreshStatus() {
+            showLoading(true);
+            try {
+                cameras = await fetchCameras();
+                renderCameras();
+                updateStatus();
+                await updateMediaMTXStatus();
+            } catch (error) {
+                console.error('Error refreshing status:', error);
+                showAlert('Failed to refresh status', 'error');
+            } finally {
+                showLoading(false);
+            }
+        }
+        
+        // Initialize page
+        document.addEventListener('DOMContentLoaded', async () => {
+            await refreshStatus();
+            
+            // Auto-refresh every 30 seconds
+            setInterval(async () => {
+                cameras = await fetchCameras();
+                renderCameras();
+                updateStatus();
+                await updateMediaMTXStatus();
+            }, 30000);
+        });
+    </script>
+</body>
+</html>
+

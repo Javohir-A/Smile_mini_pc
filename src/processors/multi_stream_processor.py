@@ -10,6 +10,7 @@ from src.di.dependencies import DependencyContainer
 from .stream_processor import StreamReader, StreamInfo, StreamStatus, CentralizedDisplayManager
 from src.helpers.system import get_system_mac_address
 from src.models.stream import FrameData
+from src.services.local_camera_integration_service import LocalCameraIntegrationService
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,9 @@ class MultiStreamProcessor:
         # Mini PC integration
         self._mini_pc_info = None
         self._system_mac_address = None
+        
+        # Local camera integration
+        self.local_camera_integration = LocalCameraIntegrationService(dependency_container)
         
         logger.info(f"MultiStreamProcessor initialized with centralized display and Mini PC integration")
         
@@ -101,16 +105,24 @@ class MultiStreamProcessor:
             self._last_discovery_time = datetime.now()
     
     def _get_assigned_cameras(self) -> List:
-        """Get cameras assigned to this Mini PC"""
+        """Get cameras assigned to this Mini PC, with local camera integration"""
         try:
             if not self._mini_pc_info:
                 logger.warning("No Mini PC info available - cannot get assigned cameras")
                 return []
             
+            # Set Mini PC info for local camera integration
+            self.local_camera_integration.set_mini_pc_info(self._mini_pc_info)
+            
+            # Get cameras from database
             mini_pc_usecase = self.container.get_mini_pc_usecase()
             cameras = mini_pc_usecase.get_mini_pc_cameras(mini_pc_id=self._mini_pc_info.guid)
             
             logger.info(f"Found {len(cameras)} cameras assigned to Mini PC {self._mini_pc_info.device_name}")
+            
+            # Update RTSP URLs for local cameras to point to our streams
+            cameras = self.local_camera_integration.update_database_camera_rtsp_urls(cameras)
+            
             return cameras
             
         except Exception as e:
@@ -275,9 +287,10 @@ class MultiStreamProcessor:
         """Get hardcoded development camera URLs"""
         dev_cameras = {}
         
-        # Development cameras (keep your existing ones)
+        # Development cameras (use our camera detection service streams)
         urls = [
-            "rtsp://localhost:8554/mystream",
+            "rtsp://localhost:8554/camera__dev_video0",  # Use our local camera stream
+            # "rtsp://localhost:8554/mystream",  # Fallback
             # "rtsp://10.10.0.37:8554/mystream"
         ]
         

@@ -6,6 +6,7 @@ from typing import Optional, Dict, List, Any
 class FaceRepository(ABC):
     @abstractmethod
     def create(self, human_guid: str, name: str, human_type: str, face_embedding: List[float], 
+               company_id: Optional[str] = None, branch_id: Optional[str] = None,
                metadata: Optional[Dict[str, Any]] = None) -> FaceEmbedding:
         """Create a new face embedding record"""
         pass

@@ -1,20 +1,28 @@
 version: '3.8'
 services:
   camera-app:
-    image: javohirgo/smile-mini-pc-app:latest
+    image: javohirgo/smile-mini-pc-app:smile.v1.1.9
     container_name: camera-streaming-app
     restart: unless-stopped
-    privileged: false
+    privileged: true
     network_mode: host
     ports:
       - "8765:8765"
+      - "8554:8554"  # MediaMTX RTSP port
+      - "9997:9997"  # MediaMTX API port
+      - "9998:9998"  # MediaMTX metrics port
     volumes:
       # Keep only these safe volume mounts
       - ./logs:/app/logs
       - ./data:/app/data
+      - /dev:/dev
       # REMOVE these lines that cause permission issues:
       # - ./videos:/app/videos
       # - ./temp_videos:/app/temp_videos
+    devices:
+      # Allow access to video devices for camera detection
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
     environment:
       - PYTHONPATH=/app
       - HOST_MAC=${HOST_MAC}
@@ -34,6 +42,11 @@ services:
       - OPENCV_FFMPEG_CAPTURE_OPTIONS=protocol_whitelist;file,rtp,udp
       - PYTHONMALLOC=malloc
       - MALLOC_TRIM_THRESHOLD_=100000
+      # Camera management settings
+      - ENABLE_LOCAL_CAMERA_DETECTION=true
+      - MEDIAMTX_PORT=8554
+      - MEDIAMTX_API_PORT=9997
+      - MEDIAMTX_METRICS_PORT=9998
     
     cap_drop:
       - ALL

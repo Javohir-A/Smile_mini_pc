@@ -13,6 +13,8 @@ import numpy as np
 import uvicorn
 from pathlib import Path
 from src.config import AppConfig
+from src.services.camera_detection_service import CameraDetectionService
+from src.api.camera_management_api import create_camera_management_api
 import queue
 import threading
 import time
@@ -65,6 +67,9 @@ class FastAPIWebSocketServer:
         self.stream_frames: Dict[str, bytes] = {}
         self.stream_stats = StreamStats(0, 0, 0, 0.0)
         
+        # Local camera management
+        self.camera_service = CameraDetectionService()
+        
         self.frame_queue = queue.Queue(maxsize=50)  # Smaller queue
         self.frame_processor_task = None
         self.processing_frames = False
@@ -74,6 +79,7 @@ class FastAPIWebSocketServer:
         
         self._setup_routes()
         self._setup_static_files()
+        self._setup_camera_management()
         
     def _setup_static_files(self):
         """Setup static file serving for frontend"""
@@ -81,6 +87,11 @@ class FastAPIWebSocketServer:
         frontend_dir = Path("frontend")
         if frontend_dir.exists():
             self.app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
+    
+    def _setup_camera_management(self):
+        """Setup camera management API routes"""
+        camera_router = create_camera_management_api(self.camera_service)
+        self.app.include_router(camera_router)
     
     def _setup_routes(self):
         """Setup FastAPI routes"""
@@ -100,6 +111,43 @@ class FastAPIWebSocketServer:
                         <p>Frontend not found. Please create frontend/index.html</p>
                         <p>WebSocket endpoint: ws://localhost:8765/ws/</p>
                         <p>API documentation: <a href="/docs">/docs</a></p>
+                        <p><a href="/camera_management.html">Camera Management</a></p>
+                    </body>
+                </html>
+                """)
+        
+        @self.app.get("/camera_management.html", response_class=HTMLResponse)
+        async def camera_management():
+            """Serve camera management page"""
+            frontend_file = Path("frontend/camera_management.html")
+            if frontend_file.exists():
+                return FileResponse(frontend_file)
+            else:
+                return HTMLResponse("""
+                <html>
+                    <head><title>Camera Management - Not Found</title></head>
+                    <body>
+                        <h1>Camera Management</h1>
+                        <p>Camera management page not found. Please create frontend/camera_management.html</p>
+                        <p><a href="/">Back to main page</a></p>
+                    </body>
+                </html>
+                """)
+        
+        @self.app.get("/test_camera_streaming.html", response_class=HTMLResponse)
+        async def test_camera_streaming():
+            """Serve camera streaming test page"""
+            test_file = Path("test_camera_streaming.html")
+            if test_file.exists():
+                return FileResponse(test_file)
+            else:
+                return HTMLResponse("""
+                <html>
+                    <head><title>Camera Test - Not Found</title></head>
+                    <body>
+                        <h1>Camera Streaming Test</h1>
+                        <p>Test page not found. Please create test_camera_streaming.html</p>
+                        <p><a href="/">Back to main page</a></p>
                     </body>
                 </html>
                 """)
@@ -139,21 +187,7 @@ class FastAPIWebSocketServer:
             """General WebSocket endpoint with command support"""
             await self._handle_general_connection(websocket)
         
-        @self.app.post("/api/cameras/{stream_id}/start")
-        async def start_camera_stream(stream_id: str):
-            """Start streaming for specific camera"""
-            if self.camera_manager:
-                # Add logic to start specific camera if needed
-                return {"message": f"Stream {stream_id} start requested"}
-            raise HTTPException(status_code=503, detail="Camera manager not available")
-        
-        @self.app.post("/api/cameras/{stream_id}/stop")
-        async def stop_camera_stream(stream_id: str):
-            """Stop streaming for specific camera"""
-            if self.camera_manager:
-                # Add logic to stop specific camera if needed
-                return {"message": f"Stream {stream_id} stop requested"}
-            raise HTTPException(status_code=503, detail="Camera manager not available")
+        # Removed conflicting routes - now handled by camera management API
     
     async def _handle_single_stream(self, websocket: WebSocket, stream_id: str):
         """Handle single stream WebSocket connection"""
@@ -394,7 +428,7 @@ class FastAPIWebSocketServer:
             # Draw label
             label_parts = []
             if hasattr(face, 'face_id') and face.face_id:
-                label_parts.append(f"ID:{face.face_id[-3:]}")
+                label_parts.appenapi/camerasd(f"ID:{face.face_id[-3:]}")
             if hasattr(face, 'confidence'):
                 label_parts.append(f"{face.confidence:.2f}")
             if hasattr(face, 'emotion') and face.emotion:
@@ -522,12 +556,19 @@ class FastAPIWebSocketServer:
         self.processing_frames = True
         self.frame_processor_task = asyncio.create_task(self._process_frame_queue())
         
+        # ADD: Initialize camera detection
+        await self._initialize_camera_detection()
+        
+        # ADD: Start stream monitoring
+        self.camera_service.start_stream_monitoring()
+        
         logger.info(f"FastAPI WebSocket server started on http://{self.host}:{self.port}")
         logger.info(f"API documentation: http://{self.host}:{self.port}/docs")
         logger.info(f"WebSocket endpoints:")
         logger.info(f"  - Single stream: ws://{self.host}:{self.port}/ws/stream/{{stream_id}}")
         logger.info(f"  - All streams: ws://{self.host}:{self.port}/ws/streams/all")
         logger.info(f"  - General: ws://{self.host}:{self.port}/ws/")
+        logger.info(f"Camera management API: http://{self.host}:{self.port}/api/cameras/")
             
     async def stop_server(self):
         """Stop FastAPI server"""
@@ -544,6 +585,9 @@ class FastAPIWebSocketServer:
             self.server.should_exit = True
             if self.server_task:
                 await self.server_task
+        # ADD: Cleanup camera service
+        self.camera_service.cleanup()
+        
         logger.info("FastAPI WebSocket server stopped")
         
     def add_frame_threadsafe(self, stream_id: str, frame: np.ndarray, detection_result=None):
@@ -663,6 +707,43 @@ class FastAPIWebSocketServer:
                 await asyncio.sleep(0.01)
         
         logger.info("Frame queue processor stopped")
+    
+    async def _initialize_camera_detection(self):
+        """Initialize camera detection and start MediaMTX"""
+        try:
+            logger.info("Initializing camera detection...")
+            
+            # Detect available cameras
+            cameras = self.camera_service.detect_cameras()
+            logger.info(f"Detected {len(cameras)} local cameras")
+            
+            # Start MediaMTX server
+            if cameras:  # Only start MediaMTX if we have cameras
+                logger.info("Starting MediaMTX server...")
+                mediamtx_started = self.camera_service.start_mediamtx()
+                if mediamtx_started:
+                    logger.info(f"MediaMTX started on port {self.camera_service.mediamtx_port}")
+                else:
+                    logger.warning("Failed to start MediaMTX server")
+            
+            # Log detected cameras
+            for camera in cameras:
+                logger.info(f"Camera: {camera.name} ({camera.device_path}) - {camera.resolution} - Status: {camera.status.value}")
+                
+        except Exception as e:
+            logger.error(f"Error initializing camera detection: {e}")
+    
+    def get_local_cameras(self):
+        """Get local camera information for external use"""
+        return self.camera_service.get_camera_list()
+    
+    def start_local_camera_stream(self, device_path: str, stream_name: str = None):
+        """Start streaming a local camera"""
+        return self.camera_service.start_camera_stream(device_path, stream_name)
+    
+    def stop_local_camera_stream(self, device_path: str):
+        """Stop streaming a local camera"""
+        return self.camera_service.stop_camera_stream(device_path)
 
     async def _broadcast_camera_list_data(self, camera_data):
         """Broadcast camera list data to clients"""

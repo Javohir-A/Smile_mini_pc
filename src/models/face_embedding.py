@@ -16,17 +16,29 @@ class FaceEmbedding:
     id: Optional[int] = None
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     metadata: Dict[str, Any] = field(default_factory=dict)
+    company_id: Optional[str] = None
+    branch_id: Optional[str] = None
     
     @classmethod
     def create_new(cls, human_guid: str, name: str, human_type: str, 
-                   face_embedding: List[float], metadata: Optional[Dict[str, Any]] = None) -> 'FaceEmbedding':
+                   face_embedding: List[float], company_id: Optional[str] = None, 
+                   branch_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> 'FaceEmbedding':
         """Create a new FaceEmbedding instance with generated timestamp"""
+        # Merge company_id and branch_id into metadata
+        merged_metadata = metadata or {}
+        if company_id:
+            merged_metadata['company_id'] = company_id
+        if branch_id:
+            merged_metadata['branch_id'] = branch_id
+            
         return cls(
             human_guid=human_guid,
             name=name,
             human_type=human_type,
             face_embedding=face_embedding,
-            metadata=metadata or {}
+            company_id=company_id,
+            branch_id=branch_id,
+            metadata=merged_metadata
         )
 @dataclass
 class SearchResult:

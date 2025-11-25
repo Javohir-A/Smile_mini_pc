@@ -7,10 +7,12 @@ class FaceUseCase:
         self.face_repository = face_repository
     
     def create_face(self, human_guid: str, name: str, human_type, face_embedding: List[float], 
+                   company_id: Optional[str] = None, branch_id: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> FaceEmbedding:
         """Create a new face embedding"""
         try:
-            return self.face_repository.create(human_guid, name, human_type, face_embedding, metadata)
+            return self.face_repository.create(human_guid, name, human_type, face_embedding, 
+                                             company_id, branch_id, metadata)
         except ValueError as e:
             raise ValueError(f"Invalid face embedding: {str(e)}")
         except Exception as e:

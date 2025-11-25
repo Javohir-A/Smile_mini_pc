@@ -621,14 +621,17 @@ class FaceDetectionProcessor:
             face_embedding, limit=5, threshold=2.0
         )
         
-        company_id = self.mini_pc_info.company_id
-        best_match = search_results[0]
-        # search_results[:3]
-        if not(best_match.company_id == company_id):
-            logger.info(f"🔍 Company id didn't match: Face {face_id} - processing as unknown")
-        
         if not search_results:
             logger.info(f"🔍 NO MATCHES: Face {face_id} - processing as unknown")
+            return
+        
+        company_id = self.mini_pc_info.company_id
+        best_match = search_results[0]
+        
+        # Validate company_id match
+        if best_match.company_id and best_match.company_id != company_id:
+            logger.info(f"🔍 Company id didn't match: Face {face_id} - processing as unknown")
+            logger.info(f"  Expected: {company_id}, Found: {best_match.company_id}")
             return
         
         # Log matches

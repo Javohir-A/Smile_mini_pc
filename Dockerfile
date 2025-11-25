@@ -17,13 +17,21 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 FROM python:3.11-slim
 WORKDIR /app
 
-# Install runtime dependencies including FFmpeg
+# Install runtime dependencies including FFmpeg and MediaMTX
 RUN apt-get update && apt-get install -y \
     ffmpeg libpq-dev \
     libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
     libopenblas-dev liblapack-dev  \
-    iproute2 \
+    iproute2 v4l-utils \
+    wget curl \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Download and install MediaMTX
+RUN wget -O /tmp/mediamtx.tar.gz https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_v1.14.0_linux_amd64.tar.gz \
+    && tar -xzf /tmp/mediamtx.tar.gz -C /tmp \
+    && mv /tmp/mediamtx /usr/local/bin/mediamtx \
+    && chmod +x /usr/local/bin/mediamtx \
+    && rm /tmp/mediamtx.tar.gz
 
 # Copy Python packages from builder stage
 COPY --from=builder /install /usr/local

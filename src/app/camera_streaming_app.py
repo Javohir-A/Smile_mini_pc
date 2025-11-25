@@ -10,6 +10,7 @@ from src.processors.stream_factory import StreamProcessorFactory
 from src.config.settings import AppConfig
 from src.config import AppConfig
 from src.di.dependencies import initialize_dependencies, DependencyContainer
+from src.services.local_camera_integration_service import LocalCameraIntegrationService
 from .monitoring import ResourceMonitor
 
 logging.basicConfig(level=logging.ERROR)
@@ -29,6 +30,9 @@ class StreamApplication:
         # Mini PC information
         self.mini_pc_info = None
         self.assigned_cameras = []
+        
+        # Local camera integration
+        self.local_camera_integration = LocalCameraIntegrationService(dependency_container)
         
         self.resource_monitor = ResourceMonitor()
         
@@ -140,6 +144,20 @@ class StreamApplication:
                 else:
                     logger.warning("⚠️  No cameras assigned to this Mini PC")
                     logger.info("💡 Add cameras to this Mini PC in the admin panel")
+                
+                # Integrate local cameras with database discovery
+                logger.info("🔗 Integrating local cameras with database discovery...")
+                self.local_camera_integration.set_mini_pc_info(mini_pc)
+                integration_result = self.local_camera_integration.detect_and_start_local_cameras()
+                
+                if "error" not in integration_result:
+                    logger.info(f"✅ Local camera integration complete:")
+                    logger.info(f"   - Local cameras detected: {integration_result['local_cameras_detected']}")
+                    logger.info(f"   - Database cameras assigned: {integration_result['database_cameras_assigned']}")
+                    logger.info(f"   - Local streams started: {integration_result['local_streams_started']}")
+                    logger.info(f"   - Successful streams: {integration_result['successful_streams']}")
+                else:
+                    logger.error(f"❌ Local camera integration failed: {integration_result['error']}")
                 
                 return True
                 

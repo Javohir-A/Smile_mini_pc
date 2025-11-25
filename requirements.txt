@@ -39,3 +39,4 @@ ucode-sdk==1.0.5
 ffmpeg==1.4
 pika
 redis
+dotenv

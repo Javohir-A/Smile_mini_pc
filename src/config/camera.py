@@ -44,11 +44,12 @@ class CameraConfig(BaseConfig):
     def __post_init__(self):
         if not self.rtsp_urls:
             self.rtsp_urls = [
-                "rtsp://localhost:8554/mystream"
-                "rtsp://odmen:1qaz2wsx@10.0.34.193:554/Streaming/Channels/102?rtsp_transport=tcp",
-                "rtsp://odmen:1qaz2wsx@10.0.12.162:554/Streaming/Channels/102?rtsp_transport=tcp",
+                "rtsp://localhost:8554/camera__dev_video0",  # Use our local camera stream
+                "rtsp://localhost:8554/mystream",  # Keep mystream as fallback
+                # "rtsp://odmen:1qaz2wsx@10.0.34.193:554/Streaming/Channels/102?rtsp_transport=tcp",
+                # "rtsp://odmen:1qaz2wsx@10.0.12.162:554/Streaming/Channels/102?rtsp_transport=tcp",
                 # "rtsp://admin:Abc12345@192.168.150.116:554/Streaming/Channels/102?rtsp_transport=tcp", #out of service 
-                "rtsp://admin:abc12345@192.168.150.175:554/Streaming/Channels/102?rtsp_transport=tcp"
+                # "rtsp://admin:abc12345@192.168.150.175:554/Streaming/Channels/102?rtsp_transport=tcp"
             ]
     
     @classmethod

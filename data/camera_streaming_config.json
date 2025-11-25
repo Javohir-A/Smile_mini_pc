@@ -1,0 +1,6 @@
+{
+  "auto_start_cameras": {
+    "/dev/video2": true
+  },
+  "last_updated": 1758082929.4124193
+}

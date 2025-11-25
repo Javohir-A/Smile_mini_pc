@@ -1,0 +1,30 @@
+[Unit]
+Description=Smile Mini PC Camera Streaming Service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=javokhir
+Group=javokhir
+WorkingDirectory=/home/javokhir/go/src/gitlab.com/udevs/smile/smile_mini_pc_app
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONPATH=/home/javokhir/go/src/gitlab.com/udevs/smile/smile_mini_pc_app
+Environment=ENABLE_LOCAL_CAMERA_DETECTION=true
+Environment=MEDIAMTX_PORT=8554
+Environment=MEDIAMTX_API_PORT=9997
+Environment=MEDIAMTX_METRICS_PORT=9998
+
+# Camera device access
+SupplementaryGroups=video
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=smile-camera-streaming
+
+[Install]
+WantedBy=multi-user.target
+

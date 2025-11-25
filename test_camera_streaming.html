@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test Camera Streaming</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .camera-card {
+            border: 1px solid #ddd;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 8px;
+            background: #f9f9f9;
+        }
+        .btn {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        .btn:hover {
+            background: #0056b3;
+        }
+        .btn-success {
+            background: #28a745;
+        }
+        .btn-danger {
+            background: #dc3545;
+        }
+        .status {
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .status-available {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status-streaming {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+        .rtsp-url {
+            background: #e9ecef;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: monospace;
+            margin: 10px 0;
+            word-break: break-all;
+        }
+        .log {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 10px;
+            border-radius: 5px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎥 Camera Streaming Test</h1>
+        <p>This page tests the camera streaming functionality directly.</p>
+        
+        <div>
+            <button class="btn" onclick="detectCameras()">🔍 Detect Cameras</button>
+            <button class="btn" onclick="startMediaMTX()">🚀 Start MediaMTX</button>
+            <button class="btn btn-danger" onclick="stopAllStreams()">⏹️ Stop All Streams</button>
+        </div>
+        
+        <div id="cameras-container">
+            <p>Click "Detect Cameras" to see available cameras.</p>
+        </div>
+        
+        <div id="log-container">
+            <h3>Logs:</h3>
+            <div id="log" class="log"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8765';
+        
+        function log(message) {
+            const logElement = document.getElementById('log');
+            const timestamp = new Date().toLocaleTimeString();
+            logElement.innerHTML += `[${timestamp}] ${message}\n`;
+            logElement.scrollTop = logElement.scrollHeight;
+        }
+        
+        async function detectCameras() {
+            try {
+                log('Detecting cameras...');
+                const response = await fetch(`${API_BASE}/api/cameras/detect`, {
+                    method: 'POST'
+                });
+                const cameras = await response.json();
+                
+                log(`Found ${cameras.length} cameras`);
+                renderCameras(cameras);
+                
+            } catch (error) {
+                log(`Error detecting cameras: ${error.message}`);
+            }
+        }
+        
+        async function startMediaMTX() {
+            try {
+                log('Starting MediaMTX...');
+                const response = await fetch(`${API_BASE}/api/cameras/status/mediamtx/start`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                
+                if (result.success) {
+                    log('MediaMTX started successfully');
+                } else {
+                    log(`Failed to start MediaMTX: ${result.message}`);
+                }
+            } catch (error) {
+                log(`Error starting MediaMTX: ${error.message}`);
+            }
+        }
+        
+        async function startStream(devicePath, autoStart = false) {
+            try {
+                const endpoint = autoStart ? 'stream/auto-start' : 'stream';
+                log(`Starting stream for ${devicePath}${autoStart ? ' with auto-start' : ''}...`);
+                
+                const response = await fetch(`${API_BASE}/api/cameras/by-path/${encodeURIComponent(devicePath)}/${endpoint}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        device_path: devicePath
+                    })
+                });
+                
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    log(`HTTP Error ${response.status}: ${errorText}`);
+                    return;
+                }
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    log(`Stream started: ${result.stream_name}${autoStart ? ' (auto-start enabled)' : ''}`);
+                    if (result.rtsp_url) {
+                        log(`RTSP URL: ${result.rtsp_url}`);
+                    }
+                    detectCameras(); // Refresh the list
+                } else {
+                    const errorMsg = result.message || result.detail || 'Unknown error';
+                    log(`Failed to start stream: ${errorMsg}`);
+                }
+            } catch (error) {
+                log(`Error starting stream: ${error.message}`);
+            }
+        }
+        
+        async function startStreamWithResolution(devicePath, autoStart = false) {
+            try {
+                // Get selected resolution
+                const resolutionSelect = document.getElementById(`resolution-${devicePath.replace('/', '_')}`);
+                const selectedResolution = resolutionSelect ? resolutionSelect.value : null;
+                
+                let resolution = null;
+                if (selectedResolution) {
+                    const [width, height] = selectedResolution.split(',').map(Number);
+                    resolution = [width, height];
+                }
+                
+                log(`Starting stream for ${devicePath}${autoStart ? ' with auto-start' : ''}${resolution ? ` at ${resolution[0]}x${resolution[1]}` : ''}...`);
+                
+                const response = await fetch(`${API_BASE}/api/cameras/by-path/${encodeURIComponent(devicePath)}/stream`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        device_path: devicePath,
+                        resolution: resolution,
+                        auto_start: autoStart
+                    })
+                });
+                
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    log(`HTTP Error ${response.status}: ${errorText}`);
+                    return;
+                }
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    log(`Stream started: ${result.stream_name}${autoStart ? ' (auto-start enabled)' : ''}`);
+                    if (result.rtsp_url) {
+                        log(`RTSP URL: ${result.rtsp_url}`);
+                    }
+                    detectCameras(); // Refresh the list
+                } else {
+                    const errorMsg = result.message || result.detail || 'Unknown error';
+                    log(`Failed to start stream: ${errorMsg}`);
+                }
+            } catch (error) {
+                log(`Error starting stream: ${error.message}`);
+            }
+        }
+        
+        async function stopStream(devicePath) {
+            try {
+                log(`Stopping stream for ${devicePath}...`);
+                const response = await fetch(`${API_BASE}/api/cameras/by-path/${encodeURIComponent(devicePath)}/stop`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                
+                if (result.success) {
+                    log('Stream stopped successfully');
+                    detectCameras(); // Refresh the list
+                } else {
+                    log(`Failed to stop stream: ${result.message}`);
+                }
+            } catch (error) {
+                log(`Error stopping stream: ${error.message}`);
+            }
+        }
+        
+        async function stopAllStreams() {
+            try {
+                log('Stopping all streams...');
+                const response = await fetch(`${API_BASE}/api/cameras/stop-all`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                
+                if (result.success) {
+                    log('All streams stopped');
+                    detectCameras(); // Refresh the list
+                } else {
+                    log(`Failed to stop streams: ${result.message}`);
+                }
+            } catch (error) {
+                log(`Error stopping streams: ${error.message}`);
+            }
+        }
+        
+        function renderCameras(cameras) {
+            const container = document.getElementById('cameras-container');
+            
+            if (cameras.length === 0) {
+                container.innerHTML = '<p>No cameras detected.</p>';
+                return;
+            }
+            
+            container.innerHTML = cameras.map(camera => {
+                const resolutions = camera.capabilities?.available_resolutions || [camera.resolution];
+                const resolutionOptions = resolutions.map(res => 
+                    `<option value="${res[0]},${res[1]}">${res[0]}x${res[1]}</option>`
+                ).join('');
+                
+                return `
+                <div class="camera-card">
+                    <h3>${camera.name}</h3>
+                    <p><strong>Device:</strong> ${camera.device_path}</p>
+                    <p><strong>Default Resolution:</strong> ${camera.resolution[0]}x${camera.resolution[1]}</p>
+                    <p><strong>Available Resolutions:</strong> ${resolutions.map(r => `${r[0]}x${r[1]}`).join(', ')}</p>
+                    <p><strong>Formats:</strong> ${camera.supported_formats.join(', ')}</p>
+                    <p><strong>Status:</strong> <span class="status status-${camera.status}">${camera.status}</span></p>
+                    
+                    ${camera.is_streaming && camera.rtsp_url ? `
+                        <div class="rtsp-url">
+                            <strong>RTSP URL:</strong><br>
+                            ${camera.rtsp_url}
+                        </div>
+                    ` : ''}
+                    
+                    <div>
+                        ${camera.is_streaming ? `
+                            <button class="btn btn-danger" onclick="stopStream('${camera.device_path}')">
+                                ⏹️ Stop Stream
+                            </button>
+                        ` : `
+                            <div style="margin-bottom: 10px;">
+                                <label for="resolution-${camera.device_path.replace('/', '_')}">Resolution:</label>
+                                <select id="resolution-${camera.device_path.replace('/', '_')}" style="margin-left: 10px;">
+                                    ${resolutionOptions}
+                                </select>
+                            </div>
+                            <button class="btn btn-success" onclick="startStreamWithResolution('${camera.device_path}')">
+                                ▶️ Start Stream
+                            </button>
+                            <button class="btn btn-success" onclick="startStreamWithResolution('${camera.device_path}', true)">
+                                🔄 Start with Auto-Restart
+                            </button>
+                        `}
+                    </div>
+                </div>
+            `;
+            }).join('');
+        }
+        
+        // Auto-detect cameras on page load
+        window.onload = function() {
+            log('Page loaded, detecting cameras...');
+            detectCameras();
+        };
+    </script>
+</body>
+</html>

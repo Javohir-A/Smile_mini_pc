@@ -86,12 +86,14 @@ class MilvusFaceRepository(FaceRepository):
             return {}
     
     def create(self, human_guid: str, name: str, human_type: str, face_embedding: List[float], 
+               company_id: Optional[str] = None, branch_id: Optional[str] = None,
                metadata: Optional[Dict[str, Any]] = None) -> FaceEmbedding:
         
         if len(face_embedding) != self.embedding_dim:
             raise ValueError(f"Face embedding must have {self.embedding_dim} dimensions")
         
-        face_emb = FaceEmbedding.create_new(human_guid, name, human_type, face_embedding, metadata)
+        face_emb = FaceEmbedding.create_new(human_guid, name, human_type, face_embedding, 
+                                          company_id, branch_id, metadata)
         
         # FIXED: Use proper column format for Milvus insert
         # Schema fields order: id (auto), human_guid, name, face_embedding, created_at, metadata, human_type
@@ -571,7 +573,7 @@ class MilvusFaceRepository(FaceRepository):
                 anns_field="face_embedding",
                 param=search_params,
                 limit=limit,
-                output_fields=["id", "human_guid", "name", "human_type", "metadata"]
+                output_fields=["id", "human_guid", "name", "human_type", "company_id", "branch_id", "metadata"]
             )
 
             search_results = []
@@ -601,6 +603,11 @@ class MilvusFaceRepository(FaceRepository):
                                 logger.warning(f"Could not extract entity data from search result")
                                 continue
                         
+                        # Extract company_id and branch_id from metadata
+                        deserialized_metadata = self._deserialize_metadata(entity_metadata)
+                        entity_company_id = deserialized_metadata.get('company_id')
+                        entity_branch_id = deserialized_metadata.get('branch_id')
+                        
                         # Calculate recognition confidence (1 - normalized distance)
                         recognition_confidence = max(0.0, 1.0 - (hit.distance / 2.0))  # Normalize L2 distance
                         
@@ -612,6 +619,8 @@ class MilvusFaceRepository(FaceRepository):
                             similarity_score=hit.score,
                             distance=hit.distance,
                             recognition_confidence=recognition_confidence,
+                            company_id=entity_company_id,
+                            branch_id=entity_branch_id,
                             metadata=self._deserialize_metadata(entity_metadata)
                         ))
             
