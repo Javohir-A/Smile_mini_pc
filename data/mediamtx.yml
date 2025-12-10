@@ -1,0 +1,12 @@
+# MediaMTX configuration for camera streaming
+rtspAddress: :8554
+rtspEncryption: "no"
+rtpAddress: :8000
+rtcpAddress: :8001
+api: yes
+apiAddress: :9997
+logLevel: info
+
+paths:
+  ~^.*$:
+    source: publisher
